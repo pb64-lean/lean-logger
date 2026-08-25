@@ -470,11 +470,15 @@ private def awaitDeliveries (shared : SuppressionShared) : IO Unit := do
 private def closeOwner
     (suppressor : DuplicateSuppressor)
     (upstreamFinalEvents : Array LogEvent) : IO Unit := do
-  suppressor.shared.child.quiesce
+  let quiesceFailure? ← try
+    suppressor.shared.child.quiesce
+    pure (none : Option IO.Error)
+  catch error =>
+    pure (some error)
   awaitDeliveries suppressor.shared
   let summaries ← closeSummaries suppressor.shared
   let finalEvents := summaries ++ upstreamFinalEvents
-  let failure? ← do
+  let closeFailure? ← do
     try
       if !(← suppressor.shared.child.tryCloseAfter finalEvents) then
         for event in finalEvents do
@@ -482,8 +486,16 @@ private def closeOwner
         suppressor.shared.child.close
       pure none
     catch error =>
-      recordChildFailure suppressor.shared .close
       pure (some error)
+  if quiesceFailure?.isSome || closeFailure?.isSome then
+    recordChildFailure suppressor.shared .close
+  let failure? := match quiesceFailure?, closeFailure? with
+    | none, none => none
+    | some error, none | none, some error => some error
+    | some quiesceError, some closeError =>
+        some <| IO.userError <|
+          s!"duplicate-suppressor child quiescence failed ({quiesceError}) " ++
+          s!"and close failed ({closeError})"
   completeClose suppressor.shared <| match failure? with
     | none => .ok ()
     | some error => .error error

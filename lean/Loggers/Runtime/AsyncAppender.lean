@@ -77,12 +77,14 @@ structure AsyncStats where
   admitted : Nat
   /-- Owner-only events accepted atomically with the close fence. -/
   terminalAdmitted : Nat
-  /-- Successfully delivered normal events. -/
+  /-- Normal events whose immediate child append completed successfully. -/
   delivered : Nat
-  /-- Successfully delivered owner-only terminal events. -/
+  /-- Terminal batch entries whose child close operation completed successfully. -/
   terminalDelivered : Nat
   droppedNewest : Nat
   droppedOldest : Nat
+  /-- Admitted queued events cleared by supervised worker failure. -/
+  discardedOnFailure : Nat
   rejected : Nat
   appendFailures : Nat
   flushFailures : Nat
@@ -97,6 +99,7 @@ private structure Counters where
   terminalDelivered : Nat := 0
   droppedNewest : Nat := 0
   droppedOldest : Nat := 0
+  discardedOnFailure : Nat := 0
   rejected : Nat := 0
   appendFailures : Nat := 0
   flushFailures : Nat := 0
@@ -112,6 +115,9 @@ private inductive WorkItem where
 private structure AsyncState where
   phase : AsyncPhase := .open
   quiescing : Bool := false
+  quiesceStarted : Bool := false
+  quiesceComplete : Bool := false
+  quiesceFailure? : Option IO.Error := none
   queue : Std.Queue WorkItem := Std.Queue.empty
   queuedEvents : Nat := 0
   terminalEvents : Array LogEvent := #[]
@@ -155,6 +161,37 @@ private def attemptIO (action : IO Unit) : IO (Option IO.Error) := do
     pure none
   catch error =>
     pure (some error)
+
+private def awaitQuiescenceFailure (shared : AsyncShared) : IO (Option IO.Error) :=
+  shared.state.atomically do
+    shared.workAvailable.waitUntil shared.state do
+      pure (← get).quiesceComplete
+    pure (← get).quiesceFailure?
+
+private def quiesceShared (shared : AsyncShared) : IO Unit := do
+  let ownsQuiescence ← shared.state.atomically do
+    let state ← get
+    if state.quiesceComplete || state.quiesceStarted then
+      pure false
+    else
+      set {
+        state with
+        quiescing := true
+        quiesceStarted := true
+        quiesceFailure? := none
+      }
+      liftM shared.spaceAvailable.notifyAll
+      pure true
+  if ownsQuiescence then
+    let failure? ← attemptIO shared.child.quiesce
+    shared.state.atomically do
+      modify fun state => {
+        state with quiesceComplete := true, quiesceFailure? := failure?
+      }
+      liftM shared.workAvailable.notifyAll
+  match ← awaitQuiescenceFailure shared with
+  | none => pure ()
+  | some error => throw error
 
 private def queueFromList (items : List WorkItem) : Std.Queue WorkItem :=
   items.foldl (fun queue item => queue.enqueue item) Std.Queue.empty
@@ -278,7 +315,10 @@ private def takeWork (shared : AsyncShared) : IO (Option WorkItem) :=
   shared.state.atomically do
     shared.workAvailable.waitUntil shared.state do
       let state ← get
-      pure (!state.queue.isEmpty || state.phase != .open)
+      pure <| match state.queue.dequeue? with
+        | some (.failure _, _) => state.quiesceComplete
+        | some _ => true
+        | none => state.phase != .open && state.quiesceComplete
     let state ← get
     match state.queue.dequeue? with
     | some (item, remaining) =>
@@ -364,16 +404,24 @@ private def finish
   shared.closeResult.resolve result
 
 private def shutdownChild (shared : AsyncShared) : IO Unit := do
+  let quiesceFailure? ← awaitQuiescenceFailure shared
   let terminalEvents ← shared.state.atomically do
     let state ← get
     set { state with terminalEvents := #[] }
     pure state.terminalEvents
   let closeFailure? ← attemptIO (shared.child.closeAfter terminalEvents)
-  if closeFailure?.isSome then
+  if quiesceFailure?.isSome || closeFailure?.isSome then
     recordCloseFailure shared
-  else
+  if closeFailure?.isNone then
     recordTerminalDelivery shared terminalEvents.size
-  match closeFailure? with
+  let failure? := match quiesceFailure?, closeFailure? with
+    | none, none => none
+    | some error, none | none, some error => some error
+    | some quiesceError, some closeError =>
+        some <| IO.userError <|
+          s!"asynchronous child quiescence failed ({quiesceError}) " ++
+          s!"and close failed ({closeError})"
+  match failure? with
   | none => finish shared (.ok ())
   | some error => finish shared (.error error)
 
@@ -402,6 +450,11 @@ private def failWorker (shared : AsyncShared) (error : IO.Error) : IO Unit := do
       queue := Std.Queue.empty
       queuedEvents := 0
       terminalEvents := #[]
+      counters := {
+        state.counters with
+        discardedOnFailure :=
+          state.counters.discardedOnFailure + state.queuedEvents
+      }
       failure? := some error
     }
     liftM shared.spaceAvailable.notifyAll
@@ -410,11 +463,15 @@ private def failWorker (shared : AsyncShared) (error : IO.Error) : IO Unit := do
   for barrier in barriers do
     barrier.resolve (.error error)
   report shared .append s!"asynchronous worker failed: {error}"
+  let quiesceFailure? ← attemptIO (quiesceShared shared)
+  if let some quiesceError := quiesceFailure? then
+    report shared .close (toString quiesceError)
   let closeFailure? ← attemptIO (shared.child.closeAfter terminalEvents)
   if let some closeError := closeFailure? then
-    recordCloseFailure shared
     report shared .close (toString closeError)
-  else
+  if quiesceFailure?.isSome || closeFailure?.isSome then
+    recordCloseFailure shared
+  if closeFailure?.isNone then
     recordTerminalDelivery shared terminalEvents.size
   shared.closeResult.resolve (.error error)
 
@@ -528,18 +585,13 @@ Ordinary direct offers are rejected after this operation. Events already owned
 by an enclosing appender or runtime retain their drain path through the started
 appender view. -/
 def AsyncAppender.quiesce (appender : AsyncAppender) : IO Unit := do
-  appender.shared.state.atomically do
-    let state ← get
-    if state.phase == .open && !state.quiescing then
-      set { state with quiescing := true }
-    liftM appender.shared.spaceAvailable.notifyAll
-  appender.shared.child.quiesce
+  quiesceShared appender.shared
 
 /-- Request a supervised terminal worker failure.
 
 When this call wins the lifecycle transition, ordinary admission is fenced,
 blocked admission is quiesced, pending queue work is discarded by the exact
-worker, pending flushes receive `error`, and the child is retired once. The
+worker, queued flush barriers receive `error`, and the child is retired once. The
 resulting failure is replayed by `flush` and `close`. This explicit seam is also
 useful for deterministic supervisor tests. -/
 def AsyncAppender.requestFailure
@@ -547,7 +599,7 @@ def AsyncAppender.requestFailure
     (error : IO.Error) : IO Bool := do
   let ownsFailure ← beginFailure appender error
   if ownsFailure then
-    appender.shared.child.quiesce
+    appender.quiesce
   pure ownsFailure
 
 /-- Atomically fence ordinary admission, retain an owner-only terminal batch,
@@ -560,7 +612,7 @@ def AsyncAppender.closeAfter
     (appender : AsyncAppender)
     (finalEvents : Array LogEvent) : IO Unit := do
   if ← requestClose appender finalEvents then
-    appender.shared.child.quiesce
+    discard <| attemptIO appender.quiesce
   let closeResult ← awaitBarrier appender.shared.closeResult
   let workerResult ← IO.wait appender.worker
   match closeResult, workerResult with
@@ -589,6 +641,7 @@ def AsyncAppender.stats (appender : AsyncAppender) : IO AsyncStats :=
       terminalDelivered := state.counters.terminalDelivered
       droppedNewest := state.counters.droppedNewest
       droppedOldest := state.counters.droppedOldest
+      discardedOnFailure := state.counters.discardedOnFailure
       rejected := state.counters.rejected
       appendFailures := state.counters.appendFailures
       flushFailures := state.counters.flushFailures
@@ -597,7 +650,7 @@ def AsyncAppender.stats (appender : AsyncAppender) : IO AsyncStats :=
 
 private def admissionFailure (name : String) : Admission → Option IO.Error
   | .rejected phase => some <| IO.userError s!"asynchronous appender {name} rejected event in {repr phase} phase"
-  | .quiesced => some <| IO.userError s!"asynchronous appender {name} rejected a blocked event while quiescing"
+  | .quiesced => some <| IO.userError s!"asynchronous appender {name} rejected an ordinary event while quiescing"
   | .admitted | .droppedNewest | .admittedAfterDropOldest => none
 
 /-- View the asynchronous handle as a standard started appender. -/

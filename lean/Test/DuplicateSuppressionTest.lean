@@ -330,6 +330,26 @@ private def testFailedCloseResult : IO Unit := do
   expectEq (← closeCalls.get) 1 "shared failed close result"
   expectEq (← diagnosticCalls.get) 0 "explicit close failure diagnostics"
 
+private def testFailedQuiescenceStillCloses : IO Unit := do
+  let quiesceCalls ← IO.mkRef 0
+  let closeCalls ← IO.mkRef 0
+  let child : StartedAppender := {
+    name := "failed-quiesce"
+    append := fun _ => pure ()
+    quiesce := do
+      quiesceCalls.modify (· + 1)
+      throw (IO.userError "quiesce failed")
+    close := closeCalls.modify (· + 1)
+  }
+  let suppressor ← DuplicateSuppressor.start child
+  expectError suppressor.close "quiesce failed" "suppressor quiesce failure"
+  expectError suppressor.close "quiesce failed" "repeated suppressor quiesce failure"
+  expectEq (← quiesceCalls.get) 1 "suppressor exact failed quiesce"
+  expectEq (← closeCalls.get) 1 "suppressor close after quiesce failure"
+  let stats ← suppressor.stats
+  expectEq stats.phase .failed "suppressor quiesce-failed phase"
+  expectEq stats.closeFailures 1 "suppressor quiesce-failed counter"
+
 private def testFailedFlushResult : IO Unit := do
   let diagnosticCalls ← IO.mkRef 0
   let services : RuntimeServices := {
@@ -507,6 +527,7 @@ def runAll : IO Unit := do
   testDeterministicLruEviction
   testConcurrentCloseAndFinalCounts
   testFailedCloseResult
+  testFailedQuiescenceStillCloses
   testFailedFlushResult
   testNonrecursiveDiagnostics
   testBlockingAsyncComposition

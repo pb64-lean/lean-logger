@@ -193,6 +193,69 @@ private def testDirectQuiesceFence : IO Unit := do
   expectEq stats.rejected 1 "direct quiesce rejection"
   appender.close
 
+private def testCloseAwaitsChildQuiescence : IO Unit := do
+  let quiesceGate ← Gate.new
+  let childClosed ← IO.Promise.new
+  let child : StartedAppender := {
+    name := "ordered-quiesce"
+    append := fun _ => pure ()
+    quiesce := quiesceGate.enter
+    close := childClosed.resolve ()
+  }
+  let appender ← AsyncAppender.start child
+  let closing ← IO.asTask appender.close .dedicated
+  quiesceGate.waitEntered
+  expect (!(← childClosed.isResolved)) "child closed before quiescence completed"
+  expect (!(← IO.hasFinished closing)) "async close returned during child quiescence"
+  quiesceGate.release
+  discard <| waitTask closing
+  expect (← childClosed.isResolved) "child did not close after quiescence"
+
+private def testConcurrentQuiescenceIsShared : IO Unit := do
+  let quiesceGate ← Gate.new
+  let quiesceCalls ← IO.mkRef 0
+  let child : StartedAppender := {
+    name := "shared-quiesce"
+    append := fun _ => pure ()
+    quiesce := do
+      quiesceCalls.modify (· + 1)
+      quiesceGate.enter
+  }
+  let appender ← AsyncAppender.start child
+  let first ← IO.asTask appender.quiesce .dedicated
+  quiesceGate.waitEntered
+  let second ← IO.asTask appender.quiesce .dedicated
+  expect (!(← IO.hasFinished first)) "first quiesce crossed the child gate"
+  expect (!(← IO.hasFinished second)) "concurrent quiesce did not share completion"
+  expectEq (← quiesceCalls.get) 1 "exact child quiesce before release"
+  quiesceGate.release
+  discard <| waitTask first
+  discard <| waitTask second
+  appender.close
+  expectEq (← quiesceCalls.get) 1 "cached child quiesce during close"
+
+private def testQuiescenceFailureIsReplayed : IO Unit := do
+  let quiesceCalls ← IO.mkRef 0
+  let closeCalls ← IO.mkRef 0
+  let child : StartedAppender := {
+    name := "failed-quiesce"
+    append := fun _ => pure ()
+    quiesce := do
+      quiesceCalls.modify (· + 1)
+      throw (IO.userError "quiesce failed")
+    close := closeCalls.modify (· + 1)
+  }
+  let appender ← AsyncAppender.start child
+  expectError appender.quiesce "quiesce failed" "first quiesce failure"
+  expectError appender.quiesce "quiesce failed" "repeated quiesce failure"
+  expectError appender.close "quiesce failed" "close after quiesce failure"
+  expectError appender.close "quiesce failed" "repeated close after quiesce failure"
+  expectEq (← quiesceCalls.get) 1 "cached failed child quiesce"
+  expectEq (← closeCalls.get) 1 "child close after quiesce failure"
+  let stats ← appender.stats
+  expectEq stats.phase .failed "quiesce-failed phase"
+  expectEq stats.closeFailures 1 "quiesce-failed close counter"
+
 private def testFlushBarrier : IO Unit := do
   let gate ← Gate.new
   let operations ← Std.Mutex.new (#[] : Array String)
@@ -381,6 +444,7 @@ private def testSupervisedWorkerFailure : IO Unit := do
   expectEq stats.queued 0 "failed-worker queue clear"
   expectEq stats.pendingFlushes 0 "failed-worker barrier clear"
   expectEq stats.delivered 1 "failed-worker completed delivery"
+  expectEq stats.discardedOnFailure 1 "failed-worker discarded admission"
   expectEq stats.rejected 1 "failed-worker rejection count"
   expectEq (← closeCalls.get) 1 "failed-worker exact child retirement"
   match ← diagnostics.get with
@@ -470,6 +534,9 @@ def runAll : IO Unit := do
   testBlockingAdmission
   testCloseFencesAndWakes
   testDirectQuiesceFence
+  testCloseAwaitsChildQuiescence
+  testConcurrentQuiescenceIsShared
+  testQuiescenceFailureIsReplayed
   testFlushBarrier
   testFlushFailureIsolation
   testChildFailureIsolation

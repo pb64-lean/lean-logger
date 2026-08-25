@@ -42,6 +42,14 @@ def invalidStaticContext : Logger [] Unit :=
   pushNew "bad key" "value" do pure ()
 
 /--
+error: Tactic `decide` proved
+-/
+#guard_msgs (error, substring := true) in
+def duplicatePush : Logger [] Unit :=
+  pushNew "identity" "outer" do
+    pushNew "identity" "inner" do pure ()
+
+/--
 error: invalid event field name 'bad=key'
 -/
 #guard_msgs (error, substring := true) in
@@ -190,6 +198,25 @@ private def testRebindingAndRestoration : IO Unit := do
       expectEq inner.context [("identity", .nat 17)] "rebound canonical context"
       expectEq outer.context [("identity", .str "outer")] "restored context"
   | other => fail s!"expected two rebinding events, got {other.length}"
+
+private def sameTypeRebindingProgram : Logger [] Unit :=
+  pushNew "identity" "outer" do
+    rebindMDC "identity" "inner" do
+      let identity : String ← mdc "identity"
+      log! .info "same-type inner {identity}"
+    let identity : String ← mdc "identity"
+    log! .info "same-type outer {identity}"
+
+private def testSameTypeRebinding : IO Unit := do
+  let events ← IO.mkRef ([] : List LogEvent)
+  runWith (capturingCore events) sameTypeRebindingProgram
+  match ← events.get with
+  | [inner, outer] =>
+      expectEq inner.message "same-type inner inner" "same-type rebound lookup"
+      expectEq inner.context [("identity", .str "inner")] "same-type canonical erasure"
+      expectEq outer.message "same-type outer outer" "same-type restored lookup"
+      expectEq outer.context [("identity", .str "outer")] "same-type restoration"
+  | other => fail s!"expected two same-type rebinding events, got {other.length}"
 
 private def exceptionProgram : Logger [] Unit :=
   pushNew "identity" "outer" do
@@ -531,6 +558,7 @@ unsafe def runAll : IO Unit := do
   testExceptTCarrier
   testRedactionAndFieldLookup
   testRebindingAndRestoration
+  testSameTypeRebinding
   testExceptionRestoration
   testDynamicPrecedenceAndHiding
   testTypedCollision
