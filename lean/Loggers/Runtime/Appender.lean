@@ -203,10 +203,11 @@ abbrev StartedAppender.ofTarget := StartedAppender.serialized
 
 /-- Guard a started appender without changing its lifecycle or serialization.
 
-Filters run before child admission and outside the child's lifecycle boundary.
-They should be pure, prompt, and concurrency-safe. A filter racing with close
-may finish evaluation after the child has fenced admission, in which case an
-accepted event is rejected by the child. -/
+Filters run before ordinary child admission and outside the child's lifecycle
+boundary. Owner-only terminal records and records synthesized inside a
+decorator bypass this outer filter chain. Filters should be pure, prompt, and
+concurrency-safe. An append racing with an unsynchronized direct close may
+finish filtering after the child has fenced admission. -/
 def StartedAppender.withFilters
     (appender : StartedAppender)
     (filters : Array Filter) : StartedAppender := {

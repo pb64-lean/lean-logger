@@ -178,6 +178,21 @@ private def testCloseFencesAndWakes : IO Unit := do
   expectEq stats.rejected 1 "close rejection counter"
   expectEq (← appender.offer (event "late")) (.rejected .closed) "closed rejection"
 
+private def testDirectQuiesceFence : IO Unit := do
+  let child : StartedAppender := {
+    name := "direct-quiesce"
+    append := fun _ => pure ()
+  }
+  let appender ← AsyncAppender.start child
+    (options := { capacity := 1, overflowPolicy := .block })
+  appender.quiesce
+  expectEq (← appender.offer (event "late")) .quiesced "direct quiesce admission"
+  let stats ← appender.stats
+  expectEq stats.phase .open "direct quiesce phase"
+  expect stats.quiescing "direct quiesce state"
+  expectEq stats.rejected 1 "direct quiesce rejection"
+  appender.close
+
 private def testFlushBarrier : IO Unit := do
   let gate ← Gate.new
   let operations ← Std.Mutex.new (#[] : Array String)
@@ -311,23 +326,23 @@ private def testNestedBlockingCloseProgress : IO Unit := do
 
   let closer ← IO.asTask (outer.closeAfter #[event "terminal"]) .dedicated
   waitUntil do
-    pure ((← inner.stats).phase == AsyncPhase.closing)
+    pure ((← inner.stats).quiescing)
   expect (!(← IO.hasFinished closer)) "nested close crossed the terminal child"
   let outerBeforeRelease ← outer.stats
-  expectEq outerBeforeRelease.appendFailures 2 "nested quiesce rejection count"
+  expectEq outerBeforeRelease.appendFailures 0 "nested retained delivery failures"
   gate.release
   discard <| waitTask closer
 
-  expectEq (← messages capture) #["first", "second", "terminal"]
+  expectEq (← messages capture) #["first", "second", "third", "fourth", "terminal"]
     "nested close delivery"
   let outerStats ← outer.stats
   let innerStats ← inner.stats
   expectEq outerStats.phase .closed "outer nested close phase"
   expectEq innerStats.phase .closed "inner nested close phase"
-  expectEq outerStats.delivered 2 "outer nested normal deliveries"
+  expectEq outerStats.delivered 4 "outer nested normal deliveries"
   expectEq outerStats.terminalAdmitted 1 "outer nested terminal admission"
   expectEq outerStats.terminalDelivered 1 "outer nested terminal delivery"
-  expectEq innerStats.delivered 2 "inner nested normal deliveries"
+  expectEq innerStats.delivered 4 "inner nested normal deliveries"
   expectEq innerStats.terminalAdmitted 1 "inner nested terminal admission"
   expectEq innerStats.terminalDelivered 1 "inner nested terminal delivery"
 
@@ -454,6 +469,7 @@ def runAll : IO Unit := do
   testDropOldestRespectsFlushFence
   testBlockingAdmission
   testCloseFencesAndWakes
+  testDirectQuiesceFence
   testFlushBarrier
   testFlushFailureIsolation
   testChildFailureIsolation

@@ -201,8 +201,10 @@ private def enqueueEvent
   liftM shared.workAvailable.notifyOne
   pure admission
 
-/-- Offer one event and report whether ownership transferred to the worker. -/
-def AsyncAppender.offer (appender : AsyncAppender) (event : LogEvent) : IO Admission :=
+private def offerWithOwnership
+    (appender : AsyncAppender)
+    (event : LogEvent)
+    (alreadyOwned : Bool) : IO Admission :=
   appender.shared.state.atomically do
     modify fun state => {
       state with counters := { state.counters with offered := state.counters.offered + 1 }
@@ -210,18 +212,20 @@ def AsyncAppender.offer (appender : AsyncAppender) (event : LogEvent) : IO Admis
     let initial ← get
     if initial.phase != .open then
       rejectAdmission initial.phase
+    else if initial.quiescing && !alreadyOwned then
+      rejectQuiesced
     else
       match appender.shared.options.overflowPolicy with
       | .block =>
           appender.shared.spaceAvailable.waitUntil appender.shared.state do
             let state ← get
             pure (
-              state.phase != .open || state.quiescing ||
+              state.phase != .open || (state.quiescing && !alreadyOwned) ||
               state.queuedEvents < appender.shared.options.capacity)
           let state ← get
           if state.phase != .open then
             rejectAdmission state.phase
-          else if state.quiescing && state.queuedEvents >= appender.shared.options.capacity then
+          else if state.quiescing && !alreadyOwned then
             rejectQuiesced
           else
             enqueueEvent appender.shared event
@@ -258,6 +262,17 @@ def AsyncAppender.offer (appender : AsyncAppender) (event : LogEvent) : IO Admis
                   }
                 }
                 enqueueEvent appender.shared event .admittedAfterDropOldest
+
+/-- Offer one event and report whether ownership transferred to the worker.
+
+Owner quiescence rejects ordinary offers, including ones blocked for capacity.
+Appender decorators use a separate retained path for events whose ownership was
+already transferred before the enclosing lifecycle fence. -/
+def AsyncAppender.offer (appender : AsyncAppender) (event : LogEvent) : IO Admission :=
+  offerWithOwnership appender event false
+
+private def offerRetained (appender : AsyncAppender) (event : LogEvent) : IO Admission :=
+  offerWithOwnership appender event true
 
 private def takeWork (shared : AsyncShared) : IO (Option WorkItem) :=
   shared.state.atomically do
@@ -418,8 +433,8 @@ def AsyncAppender.start
   match options.validate with
   | .error error => throw <| IO.userError (toString error)
   | .ok () => pure ()
-  let services ← services.activate
   try
+    let services ← services.activate
     let shared : AsyncShared := {
       options
       child
@@ -509,9 +524,9 @@ private def beginFailure (appender : AsyncAppender) (error : IO.Error) : IO Bool
 
 /-- Make blocking admission prompt without releasing the owned child.
 
-Events with capacity available may still enter: an owning runtime uses this
-operation only after fencing new routes, and those offers therefore belong to
-routes already admitted before the fence. -/
+Ordinary direct offers are rejected after this operation. Events already owned
+by an enclosing appender or runtime retain their drain path through the started
+appender view. -/
 def AsyncAppender.quiesce (appender : AsyncAppender) : IO Unit := do
   appender.shared.state.atomically do
     let state ← get
@@ -590,7 +605,7 @@ def AsyncAppender.asStarted (appender : AsyncAppender) : StartedAppender :=
   ({
     name := appender.name
     append := fun event => do
-      if let some error := admissionFailure appender.name (← appender.offer event) then
+      if let some error := admissionFailure appender.name (← offerRetained appender event) then
         throw error
     flush := appender.flush
     quiesce := appender.quiesce

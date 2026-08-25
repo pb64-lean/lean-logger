@@ -540,8 +540,8 @@ def DuplicateSuppressor.start
   match options.validate with
   | .error error => throw <| IO.userError (toString error)
   | .ok () => pure ()
-  let services ← services.activate
   try
+    let services ← services.activate
     let shared : SuppressionShared := {
       options
       child

@@ -397,13 +397,13 @@ private def testBlockingAsyncComposition : IO Unit := do
   expect (!(← IO.hasFinished producer)) "producer did not block at full async child"
 
   let closer ← IO.asTask suppressor.close
-  discard <| waitTask producer
   expect (!(← IO.hasFinished closer)) "close crossed the blocked terminal child"
   gate.release
+  discard <| waitTask producer
   discard <| waitTask closer
-  expectEq (← messages capture) #["first", "second"] "async close drain"
-  expectEq (← async.stats).rejected 1 "blocked child admission wake"
-  expectEq (← suppressor.stats).childFailures 1 "rejected child delivery accounting"
+  expectEq (← messages capture) #["first", "second", "third"] "async close drain"
+  expectEq (← async.stats).rejected 0 "retained child admission"
+  expectEq (← suppressor.stats).childFailures 0 "retained child delivery accounting"
   expectEq (← suppressor.stats).phase .closed "composed close phase"
 
 private def testCloseWaitsForInFlightDelivery : IO Unit := do
