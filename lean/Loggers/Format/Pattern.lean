@@ -65,7 +65,8 @@ deriving Repr, Inhabited
 
 /-- A pattern whose syntax and named keys have already been checked. -/
 structure CompiledPattern where
-  parts : Array PatternPart
+  private mk ::
+  private parts : Array PatternPart
 deriving Repr, Inhabited
 
 private def quotePatternWidth (width : PatternWidth) : Lean.Term :=

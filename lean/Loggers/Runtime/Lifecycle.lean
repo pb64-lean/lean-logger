@@ -44,6 +44,19 @@ private def closeAppenders
         firstFailure? := some error
   pure firstFailure?
 
+private def quiesceAppenders
+    (services : RuntimeServices)
+    (appenders : Array StartedAppender) : IO (Option IO.Error) := do
+  let mut firstFailure? : Option IO.Error := none
+  for appender in appenders do
+    try
+      appender.quiesce
+    catch error =>
+      reportFailure services appender.name .close error
+      if firstFailure?.isNone then
+        firstFailure? := some error
+  pure firstFailure?
+
 private def flushAppenders
     (services : RuntimeServices)
     (appenders : Array StartedAppender) : IO (Option IO.Error) := do
@@ -195,9 +208,14 @@ private def closeRuntime
   | .owner drained done alreadyDrained =>
       if alreadyDrained then
         drained.resolve ()
-      -- Closing appenders first lets a decorator wake producers blocked in admission.
-      let failure? ← closeAppenders services appenders
+      -- Wake blocking admission while keeping every destination alive for routes
+      -- that crossed the runtime fence before shutdown began.
+      let quiesceFailure? ← quiesceAppenders services appenders
       awaitUnitPromise "runtime drain" drained
+      let closeFailure? ← closeAppenders services appenders
+      let failure? := match quiesceFailure? with
+        | some error => some error
+        | none => closeFailure?
       let result := failure?.map Except.error |>.getD (.ok ())
       state.atomically do
         modify fun current => { current with phase := .closed result }
@@ -206,13 +224,13 @@ private def closeRuntime
 
 /-- Start a validated configuration and acquire its appenders in declaration order. -/
 def CompiledConfig.start (config : CompiledConfig) : IO StartedRuntime := do
-  let services ← config.services.activate
-  let appenders ← startAppenders services config.appenders.toList
+  let services ← config.runtimeServices.activate
+  let appenders ← startAppenders services config.appenderSpecs.toList
   let state ← Std.Mutex.new ({} : RuntimeState)
   let close := closeRuntime state services appenders
   let core : CoreCtx IO := {
-    enabled := fun logger level => pure (config.levels.enabled logger level)
-    now := config.now
+    enabled := fun logger level => pure (config.enabled logger level)
+    now := config.timestampNow
     sink := emitRuntime state services appenders
     close
   }
@@ -233,9 +251,11 @@ def StartedRuntime.flush (runtime : StartedRuntime) : IO Unit :=
 
 /-- Close every appender in reverse acquisition order exactly once.
 
-Producers should be quiesced before close begins. Already-admitted runtime sink
-calls are awaited, but a filter still evaluating when close fences its child
-may subsequently have its accepted event rejected. -/
+The runtime first fences new sink calls, quiesces blocking decorators without
+releasing their children, waits for every already-admitted route, then closes
+appenders in reverse acquisition order. Application-owned producer tasks should
+still be stopped before close when the application needs to know that they
+submitted all intended events. -/
 def StartedRuntime.close (runtime : StartedRuntime) : IO Unit :=
   closeRuntime runtime.state runtime.services runtime.appenders
 

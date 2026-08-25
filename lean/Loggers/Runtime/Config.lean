@@ -87,10 +87,30 @@ structure LogConfig where
 
 /-- A fully validated configuration; starting it may acquire resources. -/
 structure CompiledConfig where
-  levels : CompiledLevels
-  appenders : Array AppenderSpec
-  now : IO Std.Time.Timestamp
-  services : RuntimeServices
+  private mk ::
+  private levels : CompiledLevels
+  private appenders : Array AppenderSpec
+  private now : IO Std.Time.Timestamp
+  private services : RuntimeServices
+
+/-- Resolve whether an event level is enabled by this validated configuration. -/
+def CompiledConfig.enabled
+    (config : CompiledConfig)
+    (logger : String)
+    (eventLevel : Level) : Bool :=
+  config.levels.enabled logger eventLevel
+
+/-- Validated appender declarations in acquisition order. -/
+def CompiledConfig.appenderSpecs (config : CompiledConfig) : Array AppenderSpec :=
+  config.appenders
+
+/-- Read the configured strict timestamp source. -/
+def CompiledConfig.timestampNow (config : CompiledConfig) : IO Std.Time.Timestamp :=
+  config.now
+
+/-- Runtime services retained by the validated configuration. -/
+def CompiledConfig.runtimeServices (config : CompiledConfig) : RuntimeServices :=
+  config.services
 
 private def validateAppenderNames
     (appenders : Array AppenderSpec) : Except ConfigError Unit := do

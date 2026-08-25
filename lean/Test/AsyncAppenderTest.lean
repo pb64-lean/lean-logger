@@ -286,6 +286,51 @@ private def testConcurrentCloseAndExactJoin : IO Unit := do
   expectEq (← closeCalls.get) 1 "exact child close"
   expectEq (← appender.stats).phase .closed "joined closed phase"
 
+private def testNestedBlockingCloseProgress : IO Unit := do
+  let gate ← Gate.new
+  let capture ← Capture.new
+  let terminal : StartedAppender := {
+    name := "nested-terminal"
+    append := fun logged => do
+      if logged.message == "first" then gate.enter
+      capture.append logged
+  }
+  let inner ← AsyncAppender.start terminal
+    (options := { capacity := 1, overflowPolicy := .block })
+  let outer ← AsyncAppender.start inner.asStarted
+    (options := { capacity := 1, overflowPolicy := .block })
+  expectEq (← outer.offer (event "first")) .admitted "nested first admission"
+  gate.waitEntered
+  expectEq (← outer.offer (event "second")) .admitted "nested second admission"
+  waitUntil do
+    pure ((← outer.stats).delivered == 2)
+  expectEq (← outer.offer (event "third")) .admitted "nested third admission"
+  waitUntil do
+    pure ((← inner.stats).offered == 3)
+  expectEq (← outer.offer (event "fourth")) .admitted "nested fourth admission"
+
+  let closer ← IO.asTask (outer.closeAfter #[event "terminal"]) .dedicated
+  waitUntil do
+    pure ((← inner.stats).phase == AsyncPhase.closing)
+  expect (!(← IO.hasFinished closer)) "nested close crossed the terminal child"
+  let outerBeforeRelease ← outer.stats
+  expectEq outerBeforeRelease.appendFailures 2 "nested quiesce rejection count"
+  gate.release
+  discard <| waitTask closer
+
+  expectEq (← messages capture) #["first", "second", "terminal"]
+    "nested close delivery"
+  let outerStats ← outer.stats
+  let innerStats ← inner.stats
+  expectEq outerStats.phase .closed "outer nested close phase"
+  expectEq innerStats.phase .closed "inner nested close phase"
+  expectEq outerStats.delivered 2 "outer nested normal deliveries"
+  expectEq outerStats.terminalAdmitted 1 "outer nested terminal admission"
+  expectEq outerStats.terminalDelivered 1 "outer nested terminal delivery"
+  expectEq innerStats.delivered 2 "inner nested normal deliveries"
+  expectEq innerStats.terminalAdmitted 1 "inner nested terminal admission"
+  expectEq innerStats.terminalDelivered 1 "inner nested terminal delivery"
+
 private def testFailedCloseResult : IO Unit := do
   let closeCalls ← IO.mkRef 0
   let diagnosticCalls ← IO.mkRef 0
@@ -370,6 +415,7 @@ def runAll : IO Unit := do
   testFlushFailureIsolation
   testChildFailureIsolation
   testConcurrentCloseAndExactJoin
+  testNestedBlockingCloseProgress
   testFailedCloseResult
   testRuntimeReportsLifecycleFailuresOnce
   testAppenderDecoration

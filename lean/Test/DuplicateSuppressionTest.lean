@@ -409,10 +409,13 @@ private def testBlockingAsyncComposition : IO Unit := do
 private def testCloseWaitsForInFlightDelivery : IO Unit := do
   let appendGate ← Gate.new
   let closeGate ← Gate.new
+  let childCloseEntered ← IO.Promise.new
   let child : StartedAppender := {
     name := "in-flight"
     append := fun _ => appendGate.enter
-    close := closeGate.enter
+    close := do
+      childCloseEntered.resolve ()
+      closeGate.enter
   }
   let suppressor ← DuplicateSuppressor.start child (options := {
     allowedPerWindow := 2
@@ -422,13 +425,57 @@ private def testCloseWaitsForInFlightDelivery : IO Unit := do
   let producer ← IO.asTask (suppressor.append <| event "in-flight") .dedicated
   appendGate.waitEntered
   let closer ← IO.asTask suppressor.close .dedicated
-  closeGate.waitEntered
-  closeGate.release
+  waitUntil do
+    pure ((← suppressor.stats).phase == DuplicateSuppressionPhase.closing)
   expect (!(← IO.hasFinished closer)) "close returned before an in-flight delivery finished"
+  expect (!(← childCloseEntered.isResolved))
+    "child close started before an in-flight delivery finished"
   appendGate.release
   discard <| waitTask producer
+  closeGate.waitEntered
+  closeGate.release
   discard <| waitTask closer
   expectEq (← suppressor.stats).phase .closed "in-flight close phase"
+
+private def testCloseSummaryFencesFullAsyncChild : IO Unit := do
+  let gate ← Gate.new
+  let capture ← Capture.new
+  let terminal : StartedAppender := {
+    name := "terminal-summary"
+    append := fun logged => do
+      if logged.message == "first" then gate.enter
+      capture.append logged
+  }
+  let async ← AsyncAppender.start terminal
+    (options := { capacity := 1, overflowPolicy := .block })
+  let suppressor ← DuplicateSuppressor.start async.asStarted (options := {
+    allowedPerWindow := 1
+    window := Duration.ofNanoseconds 100
+    capacity := 1
+  })
+  suppressor.append <| event "first"
+  gate.waitEntered
+  suppressor.append <| event "second" (timestamp := timestampAt 1)
+  suppressor.append <| event "third" (timestamp := timestampAt 2)
+  let closer ← IO.asTask suppressor.close .dedicated
+  waitUntil do
+    pure ((← async.stats).phase == AsyncPhase.closing)
+  expect (!(← IO.hasFinished closer)) "close crossed a blocked terminal child"
+  gate.release
+  discard <| waitTask closer
+  expectEq (← messages capture) #[
+    "first",
+    "duplicate event suppression started",
+    "duplicate event suppression summary"
+  ] "terminal close summary delivery"
+  let captured ← capture.events
+  expectPhase captured[2]! "closed" "terminal close summary phase"
+  expectSuppressedCount captured[2]! 2 "terminal close summary count"
+  let asyncStats ← async.stats
+  expectEq asyncStats.phase .closed "terminal async close phase"
+  expectEq asyncStats.delivered 2 "normal async delivery count"
+  expectEq asyncStats.terminalAdmitted 1 "terminal async admission count"
+  expectEq asyncStats.terminalDelivered 1 "terminal async delivery count"
 
 private def testAppenderDecoration : IO Unit := do
   let capture ← Capture.new
@@ -464,6 +511,7 @@ def runAll : IO Unit := do
   testNonrecursiveDiagnostics
   testBlockingAsyncComposition
   testCloseWaitsForInFlightDelivery
+  testCloseSummaryFencesFullAsyncChild
   testAppenderDecoration
 
 end Test.DuplicateSuppression

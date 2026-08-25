@@ -84,13 +84,28 @@ private structure SerializedState where
 
 Each implementation owns its concurrency and lifecycle policy. This makes it
 possible for decorators with blocking admission to wake producers during close.
+`quiesce` must be idempotent and prompt. It fences or wakes blocking admission
+without releasing resources, so routes already admitted by an owning runtime
+can finish before final close. Blocking decorators must propagate it to their
+children and must not fail it.
 `close` must fence new admission, drain owned work, flush, release resources,
 and be idempotent; callers therefore do not issue a separate final flush. -/
 structure StartedAppender where
   name : String
   append : LogEvent → IO Unit
   flush : IO Unit := pure ()
+  quiesce : IO Unit := pure ()
   close : IO Unit := pure ()
+  private closeAfterImpl? : Option (Array LogEvent → IO Unit) := none
+
+/-- Install an owner-only terminal-batch close implementation.
+
+Decorators with blocking admission use this hook to accept strict final records
+and fence ordinary producers in one lifecycle transition. -/
+def StartedAppender.withTerminalBatch
+    (appender : StartedAppender)
+    (closeAfter : Array LogEvent → IO Unit) : StartedAppender :=
+  { appender with closeAfterImpl? := some closeAfter }
 
 private def attempt (action : IO Unit) : IO (Option IO.Error) := do
   try
@@ -98,6 +113,44 @@ private def attempt (action : IO Unit) : IO (Option IO.Error) := do
     pure none
   catch error =>
     pure (some error)
+
+/-- Use an installed atomic terminal-batch close, returning `false` without
+effects when the appender has only the sequential fallback. -/
+def StartedAppender.tryCloseAfter
+    (appender : StartedAppender)
+    (finalEvents : Array LogEvent) : IO Bool := do
+  match appender.closeAfterImpl? with
+  | some closeAfter =>
+      closeAfter finalEvents
+      pure true
+  | none => pure false
+
+/-- Deliver owner-supplied final records and close through one lifecycle operation.
+
+The default is a best-effort sequential fallback. Lifecycle-aware decorators
+with blocking admission install an atomic implementation. This operation is
+owner-only and is called in place of `close`, never in addition to it. -/
+def StartedAppender.closeAfter
+    (appender : StartedAppender)
+    (finalEvents : Array LogEvent) : IO Unit := do
+  match appender.closeAfterImpl? with
+  | some closeAfter => closeAfter finalEvents
+  | none =>
+      let mut appendFailure? : Option IO.Error := none
+      for event in finalEvents do
+        try
+          appender.append event
+        catch error =>
+          if appendFailure?.isNone then
+            appendFailure? := some error
+      let closeFailure? ← attempt appender.close
+      match appendFailure?, closeFailure? with
+      | none, none => pure ()
+      | some error, none | none, some error => throw error
+      | some appendError, some closeError =>
+          throw <| IO.userError <|
+            s!"appender {appender.name} failed to deliver a terminal record ({appendError}) " ++
+            s!"and close ({closeError})"
 
 private def combineFailures
     (name : String)

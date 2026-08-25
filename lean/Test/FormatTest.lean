@@ -5,6 +5,12 @@ open Loggers Loggers.Format
 
 namespace Test.Format
 
+/--
+error:
+-/
+#guard_msgs (error, substring := true) in
+#check fun (compiled : CompiledPattern) => { compiled with parts := #[] }
+
 private def AppContext : List String := ["requestId", "quoted"]
 private def AppFields : List String := ["outcome", "count"]
 

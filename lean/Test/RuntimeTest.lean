@@ -6,6 +6,12 @@ open Loggers.Runtime
 
 namespace Test.Runtime
 
+/--
+error:
+-/
+#guard_msgs (error, substring := true) in
+#check fun (compiled : CompiledConfig) => { compiled with appenders := #[] }
+
 private def fail (message : String) : IO α :=
   throw (IO.userError message)
 
@@ -335,6 +341,7 @@ private def testFileAppenderModes : IO Unit :=
 private def testRuntimeAdmissionFence : IO Unit := do
   let appendEntered ← IO.Promise.new
   let appendRelease ← IO.Promise.new
+  let quiesceEntered ← IO.Promise.new
   let closeEntered ← IO.Promise.new
   let closeDone ← IO.Promise.new
   let diagnostics ← IO.mkRef ([] : List Diagnostic)
@@ -347,6 +354,9 @@ private def testRuntimeAdmissionFence : IO Unit := do
       appendEntered.resolve ()
       awaitUnit "append release" appendRelease
     flush := child.flush
+    quiesce := do
+      quiesceEntered.resolve ()
+      child.quiesce
     close := do
       closeEntered.resolve ()
       child.close
@@ -363,8 +373,9 @@ private def testRuntimeAdmissionFence : IO Unit := do
   let closeTask ← IO.asTask do
     runtime.close
     closeDone.resolve ()
-  awaitUnit "close entry" closeEntered
+  awaitUnit "quiesce entry" quiesceEntered
   expect (!(← closeDone.isResolved)) "runtime close did not wait for an admitted event"
+  expect (!(← closeEntered.isResolved)) "runtime released an appender before route drain"
   runtime.core.sink (event "rejected")
   expect ((← diagnostics.get).any fun diagnostic =>
     diagnostic.component == "runtime" && diagnostic.operation == .append)
@@ -372,7 +383,46 @@ private def testRuntimeAdmissionFence : IO Unit := do
   appendRelease.resolve ()
   discard <| waitTask appendTask
   discard <| waitTask closeTask
+  expect (← closeEntered.isResolved) "runtime did not close after route drain"
   expect (← closeDone.isResolved) "runtime close did not finish after drain"
+
+private def testRuntimeKeepsLaterAppendersOpenDuringDrain : IO Unit := do
+  let firstEntered ← IO.Promise.new
+  let firstRelease ← IO.Promise.new
+  let quiesced ← IO.Promise.new
+  let secondClosed ← IO.Promise.new
+  let delivered ← IO.mkRef ([] : List String)
+  let firstBase := AppenderSpec.custom "first" fun _ => pure {
+    append := fun _ => pure ()
+  }
+  let first := firstBase.mapStarted fun _ child => pure {
+    name := child.name
+    append := fun logged => do
+      firstEntered.resolve ()
+      awaitUnit "first appender release" firstRelease
+      child.append logged
+    flush := child.flush
+    quiesce := do
+      quiesced.resolve ()
+      child.quiesce
+    close := child.close
+  }
+  let second := AppenderSpec.custom "second" fun _ => pure {
+    append := fun logged => delivered.modify (· ++ [logged.message])
+    close := secondClosed.resolve ()
+  }
+  let runtime ← ({ appenders := #[first, second] } : Loggers.LogConfig).start
+  let emission ← IO.asTask <| runtime.core.sink (event "drained")
+  awaitUnit "first appender entry" firstEntered
+  let closing ← IO.asTask runtime.close
+  awaitUnit "runtime quiesce" quiesced
+  expect (!(← secondClosed.isResolved))
+    "a later appender closed before an already-admitted route reached it"
+  firstRelease.resolve ()
+  discard <| waitTask emission
+  discard <| waitTask closing
+  expectEq (← delivered.get) ["drained"] "full-route shutdown drain"
+  expect (← secondClosed.isResolved) "later appender was not closed"
 
 private def testBracketPreservesPrimaryFailure : IO Unit := do
   let diagnostics ← IO.mkRef ([] : List Diagnostic)
@@ -421,6 +471,7 @@ def runAll : IO Unit := do
   testConcurrentClose
   testFileAppenderModes
   testRuntimeAdmissionFence
+  testRuntimeKeepsLaterAppendersOpenDuringDrain
   testBracketPreservesPrimaryFailure
   testBracketReportsCloseFailure
 

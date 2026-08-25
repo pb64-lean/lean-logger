@@ -20,6 +20,9 @@ def Level.rank : Level → Nat
 instance : Ord Level where
   compare left right := compare left.rank right.rank
 
+/-- Proposition-valued ordering consistent with `Ord`. -/
+instance : LE Level := leOfOrd
+
 /-- Whether an event at `eventLevel` passes `threshold`. -/
 def Level.enabledBy (threshold eventLevel : Level) : Bool :=
   threshold.rank ≤ eventLevel.rank

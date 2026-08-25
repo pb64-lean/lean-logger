@@ -50,6 +50,7 @@ inductive Admission where
   | admitted
   | droppedNewest
   | admittedAfterDropOldest
+  | quiesced
   | rejected (phase : AsyncPhase)
 deriving Repr, BEq, DecidableEq, Inhabited
 
@@ -58,16 +59,28 @@ deriving Repr, BEq, DecidableEq, Inhabited
 With `dropOldest`, a later offer may still evict an admitted queued event. -/
 def Admission.isAdmitted : Admission → Bool
   | .admitted | .admittedAfterDropOldest => true
-  | .droppedNewest | .rejected _ => false
+  | .droppedNewest | .quiesced | .rejected _ => false
 
 /-- A coherent snapshot of asynchronous delivery counters and queue state. -/
 structure AsyncStats where
   phase : AsyncPhase
+  /-- Whether blocking admission has been made prompt for owner shutdown. -/
+  quiescing : Bool
+  /-- Normal admitted events still retained in the bounded queue. -/
   queued : Nat
+  /-- Owner-only terminal events retained outside the normal capacity budget. -/
+  queuedTerminal : Nat
   pendingFlushes : Nat
+  /-- Calls made through `offer`. -/
   offered : Nat
+  /-- Normal offers that entered the queue, including ones later evicted. -/
   admitted : Nat
+  /-- Owner-only events accepted atomically with the close fence. -/
+  terminalAdmitted : Nat
+  /-- Successfully delivered normal events. -/
   delivered : Nat
+  /-- Successfully delivered owner-only terminal events. -/
+  terminalDelivered : Nat
   droppedNewest : Nat
   droppedOldest : Nat
   rejected : Nat
@@ -79,7 +92,9 @@ deriving Repr, BEq, Inhabited
 private structure Counters where
   offered : Nat := 0
   admitted : Nat := 0
+  terminalAdmitted : Nat := 0
   delivered : Nat := 0
+  terminalDelivered : Nat := 0
   droppedNewest : Nat := 0
   droppedOldest : Nat := 0
   rejected : Nat := 0
@@ -95,8 +110,10 @@ private inductive WorkItem where
 
 private structure AsyncState where
   phase : AsyncPhase := .open
+  quiescing : Bool := false
   queue : Std.Queue WorkItem := Std.Queue.empty
   queuedEvents : Nat := 0
+  terminalEvents : Array LogEvent := #[]
   counters : Counters := {}
   failure? : Option IO.Error := none
 
@@ -164,6 +181,12 @@ private def rejectAdmission (phase : AsyncPhase) : Std.AtomicT AsyncState IO Adm
   }
   pure (.rejected phase)
 
+private def rejectQuiesced : Std.AtomicT AsyncState IO Admission := do
+  modify fun state => {
+    state with counters := { state.counters with rejected := state.counters.rejected + 1 }
+  }
+  pure .quiesced
+
 private def enqueueEvent
     (shared : AsyncShared)
     (event : LogEvent)
@@ -191,10 +214,14 @@ def AsyncAppender.offer (appender : AsyncAppender) (event : LogEvent) : IO Admis
       | .block =>
           appender.shared.spaceAvailable.waitUntil appender.shared.state do
             let state ← get
-            pure (state.phase != .open || state.queuedEvents < appender.shared.options.capacity)
+            pure (
+              state.phase != .open || state.quiescing ||
+              state.queuedEvents < appender.shared.options.capacity)
           let state ← get
           if state.phase != .open then
             rejectAdmission state.phase
+          else if state.quiescing && state.queuedEvents >= appender.shared.options.capacity then
+            rejectQuiesced
           else
             enqueueEvent appender.shared event
       | .dropNewest =>
@@ -256,6 +283,14 @@ private def recordDelivery (shared : AsyncShared) : IO Unit :=
       state with counters := { state.counters with delivered := state.counters.delivered + 1 }
     }
 
+private def recordTerminalDelivery (shared : AsyncShared) (count : Nat) : IO Unit :=
+  shared.state.atomically do
+    modify fun state => {
+      state with counters := {
+        state.counters with terminalDelivered := state.counters.terminalDelivered + count
+      }
+    }
+
 private def recordAppendFailure (shared : AsyncShared) : IO Unit :=
   shared.state.atomically do
     modify fun state => {
@@ -280,14 +315,18 @@ private def recordCloseFailure (shared : AsyncShared) : IO Unit :=
       }
     }
 
+private def processEvent
+    (shared : AsyncShared)
+    (event : LogEvent) : IO Unit := do
+  try
+    shared.child.append event
+    recordDelivery shared
+  catch error =>
+    recordAppendFailure shared
+    report shared .append (toString error)
+
 private def processWork (shared : AsyncShared) : WorkItem → IO Unit
-  | .event event => do
-      try
-        shared.child.append event
-        recordDelivery shared
-      catch error =>
-        recordAppendFailure shared
-        report shared .append (toString error)
+  | .event event => processEvent shared event
   | .flush result => do
       let failure? ← attemptIO shared.child.flush
       match failure? with
@@ -308,9 +347,15 @@ private def finish
   shared.closeResult.resolve result
 
 private def shutdownChild (shared : AsyncShared) : IO Unit := do
-  let closeFailure? ← attemptIO shared.child.close
+  let terminalEvents ← shared.state.atomically do
+    let state ← get
+    set { state with terminalEvents := #[] }
+    pure state.terminalEvents
+  let closeFailure? ← attemptIO (shared.child.closeAfter terminalEvents)
   if closeFailure?.isSome then
     recordCloseFailure shared
+  else
+    recordTerminalDelivery shared terminalEvents.size
   match closeFailure? with
   | none => finish shared (.ok ())
   | some error => finish shared (.error error)
@@ -330,7 +375,7 @@ private def queuedBarriers (queue : Std.Queue WorkItem) : List (IO.Promise Barri
     | .flush result => some result
 
 private def failWorker (shared : AsyncShared) (error : IO.Error) : IO Unit := do
-  let barriers ← shared.state.atomically do
+  let (barriers, terminalEvents) ← shared.state.atomically do
     let state ← get
     let barriers := queuedBarriers state.queue
     set {
@@ -338,18 +383,21 @@ private def failWorker (shared : AsyncShared) (error : IO.Error) : IO Unit := do
       phase := .failed
       queue := Std.Queue.empty
       queuedEvents := 0
+      terminalEvents := #[]
       failure? := some error
     }
     liftM shared.spaceAvailable.notifyAll
     liftM shared.workAvailable.notifyAll
-    pure barriers
+    pure (barriers, state.terminalEvents)
   for barrier in barriers do
     barrier.resolve (.error error)
   report shared .append s!"asynchronous worker failed: {error}"
-  let closeFailure? ← attemptIO shared.child.close
+  let closeFailure? ← attemptIO (shared.child.closeAfter terminalEvents)
   if let some closeError := closeFailure? then
     recordCloseFailure shared
     report shared .close (toString closeError)
+  else
+    recordTerminalDelivery shared terminalEvents.size
   shared.closeResult.resolve (.error error)
 
 private def supervisedWorker (shared : AsyncShared) : IO Unit := do
@@ -407,17 +455,52 @@ def AsyncAppender.flush (appender : AsyncAppender) : IO Unit :=
     | .ok () => pure ()
     | .error error => throw error
 
-private def requestClose (appender : AsyncAppender) : IO Unit :=
+private def requestClose
+    (appender : AsyncAppender)
+    (finalEvents : Array LogEvent) : IO Bool :=
   appender.shared.state.atomically do
     let state ← get
     if state.phase == .open then
-      set { state with phase := .closing }
+      set {
+        state with
+        phase := .closing
+        quiescing := true
+        terminalEvents := finalEvents
+        counters := {
+          state.counters with
+          terminalAdmitted := state.counters.terminalAdmitted + finalEvents.size
+        }
+      }
       liftM appender.shared.spaceAvailable.notifyAll
       liftM appender.shared.workAvailable.notifyAll
+      pure true
+    else
+      pure false
 
-/-- Fence admission, drain queued events, retire the child, and join the exact worker. -/
-def AsyncAppender.close (appender : AsyncAppender) : IO Unit := do
-  requestClose appender
+/-- Make blocking admission prompt without releasing the owned child.
+
+Events with capacity available may still enter: an owning runtime uses this
+operation only after fencing new routes, and those offers therefore belong to
+routes already admitted before the fence. -/
+def AsyncAppender.quiesce (appender : AsyncAppender) : IO Unit := do
+  appender.shared.state.atomically do
+    let state ← get
+    if state.phase == .open && !state.quiescing then
+      set { state with quiescing := true }
+    liftM appender.shared.spaceAvailable.notifyAll
+  appender.shared.child.quiesce
+
+/-- Atomically fence ordinary admission, retain an owner-only terminal batch,
+drain normal work, retire the child with that batch, and join the exact worker.
+
+Terminal records bypass this appender's normal capacity and overflow policy.
+Passing them through the child's terminal lifecycle operation also composes
+without blocking when asynchronous appenders are nested. -/
+def AsyncAppender.closeAfter
+    (appender : AsyncAppender)
+    (finalEvents : Array LogEvent) : IO Unit := do
+  if ← requestClose appender finalEvents then
+    appender.shared.child.quiesce
   let closeResult ← awaitBarrier appender.shared.closeResult
   let workerResult ← IO.wait appender.worker
   match closeResult, workerResult with
@@ -425,17 +508,25 @@ def AsyncAppender.close (appender : AsyncAppender) : IO Unit := do
   | .error error, _ => throw error
   | .ok (), .error error => throw error
 
+/-- Fence admission, drain queued events, retire the child, and join the exact worker. -/
+def AsyncAppender.close (appender : AsyncAppender) : IO Unit :=
+  appender.closeAfter #[]
+
 /-- Read one coherent statistics and lifecycle snapshot. -/
 def AsyncAppender.stats (appender : AsyncAppender) : IO AsyncStats :=
   appender.shared.state.atomically do
     let state ← get
     pure {
       phase := state.phase
+      quiescing := state.quiescing
       queued := state.queuedEvents
+      queuedTerminal := state.terminalEvents.size
       pendingFlushes := (queuedBarriers state.queue).length
       offered := state.counters.offered
       admitted := state.counters.admitted
+      terminalAdmitted := state.counters.terminalAdmitted
       delivered := state.counters.delivered
+      terminalDelivered := state.counters.terminalDelivered
       droppedNewest := state.counters.droppedNewest
       droppedOldest := state.counters.droppedOldest
       rejected := state.counters.rejected
@@ -446,17 +537,20 @@ def AsyncAppender.stats (appender : AsyncAppender) : IO AsyncStats :=
 
 private def admissionFailure (name : String) : Admission → Option IO.Error
   | .rejected phase => some <| IO.userError s!"asynchronous appender {name} rejected event in {repr phase} phase"
+  | .quiesced => some <| IO.userError s!"asynchronous appender {name} rejected a blocked event while quiescing"
   | .admitted | .droppedNewest | .admittedAfterDropOldest => none
 
 /-- View the asynchronous handle as a standard started appender. -/
-def AsyncAppender.asStarted (appender : AsyncAppender) : StartedAppender := {
-  name := appender.name
-  append := fun event => do
-    if let some error := admissionFailure appender.name (← appender.offer event) then
-      throw error
-  flush := appender.flush
-  close := appender.close
-}
+def AsyncAppender.asStarted (appender : AsyncAppender) : StartedAppender :=
+  ({
+    name := appender.name
+    append := fun event => do
+      if let some error := admissionFailure appender.name (← appender.offer event) then
+        throw error
+    flush := appender.flush
+    quiesce := appender.quiesce
+    close := appender.close
+  } : StartedAppender).withTerminalBatch appender.closeAfter
 
 /-- Decorate an appender specification with bounded asynchronous delivery. -/
 def AppenderSpec.async

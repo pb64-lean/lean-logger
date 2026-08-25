@@ -90,12 +90,25 @@ private structure SuppressionKey where
   stableFields : List (String × Option LogValue)
 deriving BEq
 
+private structure SummaryTemplate where
+  timestamp : Std.Time.Timestamp
+  level : Level
+  logger : String
+  provenance : Provenance
+
 private structure Entry where
   key : SuppressionKey
   windowStart : Std.Time.Timestamp
   admitted : Nat
   suppressed : Nat
-  template : LogEvent
+  template : SummaryTemplate
+
+private def summaryTemplate (event : LogEvent) : SummaryTemplate := {
+  timestamp := event.timestamp
+  level := event.level
+  logger := event.logger
+  provenance := event.provenance
+}
 
 private structure SuppressionCounters where
   admitted : Nat := 0
@@ -213,7 +226,7 @@ private def planNewKey
     windowStart := event.timestamp
     admitted := 1
     suppressed := 0
-    template := event
+    template := summaryTemplate event
   }
   if state.entries.length < shared.options.capacity then
     ({
@@ -260,7 +273,7 @@ private def planExistingKey
       windowStart := event.timestamp
       admitted := 1
       suppressed := 0
-      template := event
+      template := summaryTemplate event
     }
     let synthetic :=
       if hasSummary then #[suppressionSummary entry event.timestamp "resumed"] else #[]
@@ -274,7 +287,9 @@ private def planExistingKey
       }
     }, { synthetic, original? := some event })
   else if entry.admitted < shared.options.allowedPerWindow then
-    let updated := { entry with admitted := entry.admitted + 1, template := event }
+    let updated := {
+      entry with admitted := entry.admitted + 1, template := summaryTemplate event
+    }
     ({
       state with
       entries := updated :: remaining
@@ -282,7 +297,9 @@ private def planExistingKey
     }, { original? := some event })
   else
     let firstDenial := entry.suppressed = 0
-    let updated := { entry with suppressed := entry.suppressed + 1, template := event }
+    let updated := {
+      entry with suppressed := entry.suppressed + 1, template := summaryTemplate event
+    }
     let synthetic := if firstDenial then #[suppressionStart event] else #[]
     ({
       state with
@@ -450,36 +467,51 @@ private def awaitDeliveries (shared : SuppressionShared) : IO Unit := do
   | some () => pure ()
   | none => throw <| IO.userError "duplicate suppressor delivery-drain promise was dropped"
 
-private def closeOwner (suppressor : DuplicateSuppressor) : IO Unit := do
+private def closeOwner
+    (suppressor : DuplicateSuppressor)
+    (upstreamFinalEvents : Array LogEvent) : IO Unit := do
+  suppressor.shared.child.quiesce
+  awaitDeliveries suppressor.shared
   let summaries ← closeSummaries suppressor.shared
-  for event in summaries do
-    appendChild suppressor.shared event
+  let finalEvents := summaries ++ upstreamFinalEvents
   let failure? ← do
     try
-      suppressor.shared.child.close
+      if !(← suppressor.shared.child.tryCloseAfter finalEvents) then
+        for event in finalEvents do
+          appendChild suppressor.shared event
+        suppressor.shared.child.close
       pure none
     catch error =>
       recordChildFailure suppressor.shared .close
       pure (some error)
-  awaitDeliveries suppressor.shared
   completeClose suppressor.shared <| match failure? with
     | none => .ok ()
     | some error => .error error
 
-/-- Fence new decisions, emit final summaries, close the child once, and share the result.
+/-- Fence new decisions, quiesce blocking child admission, await every selected
+delivery, then atomically hand final summaries to the child's close lifecycle.
 
-Close waits for every selected delivery attempt to finish. Closing the child
-may reject an append already blocked in that child's admission policy, so
-callers requiring successful acceptance must still quiesce producers first. -/
-def DuplicateSuppressor.close (suppressor : DuplicateSuppressor) : IO Unit := do
+The first close caller owns any supplied terminal records. Concurrent and later
+callers share its exact result. -/
+def DuplicateSuppressor.closeAfter
+    (suppressor : DuplicateSuppressor)
+    (upstreamFinalEvents : Array LogEvent) : IO Unit := do
   if ← beginClose suppressor.shared then
     try
-      closeOwner suppressor
+      closeOwner suppressor upstreamFinalEvents
     catch error =>
       completeClose suppressor.shared (.error error)
   match ← awaitClose suppressor.shared with
   | .ok () => pure ()
   | .error error => throw error
+
+/-- Close without additional owner-supplied terminal records. -/
+def DuplicateSuppressor.close (suppressor : DuplicateSuppressor) : IO Unit :=
+  suppressor.closeAfter #[]
+
+/-- Propagate owner quiescence without fencing suppression decisions itself. -/
+def DuplicateSuppressor.quiesce (suppressor : DuplicateSuppressor) : IO Unit :=
+  suppressor.shared.child.quiesce
 
 /-- Read a coherent statistics and lifecycle snapshot. -/
 def DuplicateSuppressor.stats
@@ -522,12 +554,14 @@ def DuplicateSuppressor.start
   }
 
 /-- View the suppressor as a standard started appender. -/
-def DuplicateSuppressor.asStarted (suppressor : DuplicateSuppressor) : StartedAppender := {
-  name := suppressor.name
-  append := suppressor.append
-  flush := suppressor.flush
-  close := suppressor.close
-}
+def DuplicateSuppressor.asStarted (suppressor : DuplicateSuppressor) : StartedAppender :=
+  ({
+    name := suppressor.name
+    append := suppressor.append
+    flush := suppressor.flush
+    quiesce := suppressor.quiesce
+    close := suppressor.close
+  } : StartedAppender).withTerminalBatch suppressor.closeAfter
 
 /-- Decorate an appender specification with bounded duplicate suppression. -/
 def AppenderSpec.suppressDuplicates

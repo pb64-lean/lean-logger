@@ -95,6 +95,8 @@ private def capturingCore
     close := pure () }
 
 private def testLevels : IO Unit := do
+  expect (decide (Level.debug ≤ Level.info)) "level LE ordering"
+  expect (!decide (Level.error ≤ Level.warn)) "level LE reverse ordering"
   expect (Level.enabledBy .info .error) "error must pass an info threshold"
   expect (!Level.enabledBy .warn .info) "info must not pass a warn threshold"
   expectEq (Level.parse? "WARNING") (some .warn) "level parsing"
