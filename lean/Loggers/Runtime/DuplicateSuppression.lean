@@ -531,7 +531,8 @@ def DuplicateSuppressor.stats
       closeFailures := state.counters.closeFailures
     }
 
-/-- Start a bounded suppressor that assumes lifecycle ownership of `child`. -/
+/-- Start a bounded suppressor that assumes lifecycle ownership of `child`
+after options validate. Acquisition failure retires the child before returning. -/
 def DuplicateSuppressor.start
     (child : StartedAppender)
     (services : RuntimeServices := {})
@@ -540,18 +541,29 @@ def DuplicateSuppressor.start
   | .error error => throw <| IO.userError (toString error)
   | .ok () => pure ()
   let services ← services.activate
-  let shared : SuppressionShared := {
-    options
-    child
-    services
-    state := ← Std.Mutex.new ({} : SuppressionState)
-    deliveriesDrained := ← IO.Promise.new
-    closeResult := ← IO.Promise.new
-  }
-  pure {
-    name := child.name
-    shared
-  }
+  try
+    let shared : SuppressionShared := {
+      options
+      child
+      services
+      state := ← Std.Mutex.new ({} : SuppressionState)
+      deliveriesDrained := ← IO.Promise.new
+      closeResult := ← IO.Promise.new
+    }
+    pure {
+      name := child.name
+      shared
+    }
+  catch error =>
+    try
+      child.close
+    catch closeError =>
+      services.report {
+        component := child.name
+        operation := .close
+        message := toString closeError
+      }
+    throw error
 
 /-- View the suppressor as a standard started appender. -/
 def DuplicateSuppressor.asStarted (suppressor : DuplicateSuppressor) : StartedAppender :=

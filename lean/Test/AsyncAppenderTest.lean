@@ -331,6 +331,49 @@ private def testNestedBlockingCloseProgress : IO Unit := do
   expectEq innerStats.terminalAdmitted 1 "inner nested terminal admission"
   expectEq innerStats.terminalDelivered 1 "inner nested terminal delivery"
 
+private def testSupervisedWorkerFailure : IO Unit := do
+  let gate ← Gate.new
+  let closeCalls ← IO.mkRef 0
+  let diagnostics ← IO.mkRef ([] : List Diagnostic)
+  let child : StartedAppender := {
+    name := "worker-failure"
+    append := fun logged =>
+      if logged.message == "first" then gate.enter else pure ()
+    close := closeCalls.modify (· + 1)
+  }
+  let appender ← AsyncAppender.start child {
+    diagnostic := fun diagnostic => diagnostics.modify (· ++ [diagnostic])
+  } (options := { capacity := 2, overflowPolicy := .block })
+  expectEq (← appender.offer (event "first")) .admitted "failed-worker first admission"
+  gate.waitEntered
+  expectEq (← appender.offer (event "discarded")) .admitted
+    "failed-worker queued admission"
+  let flushing ← IO.asTask appender.flush .dedicated
+  waitUntil do
+    pure ((← appender.stats).pendingFlushes == 1)
+
+  expect (← appender.requestFailure (IO.userError "worker fault"))
+    "worker failure request did not own the transition"
+  expectEq (← appender.offer (event "late")) (.rejected .closing)
+    "worker failure admission fence"
+  gate.release
+  expectError (discard <| waitTask flushing) "worker fault" "failed-worker flush barrier"
+  expectError appender.close "worker fault" "failed-worker close"
+  expectError appender.close "worker fault" "failed-worker repeated close"
+
+  let stats ← appender.stats
+  expectEq stats.phase .failed "failed-worker phase"
+  expectEq stats.queued 0 "failed-worker queue clear"
+  expectEq stats.pendingFlushes 0 "failed-worker barrier clear"
+  expectEq stats.delivered 1 "failed-worker completed delivery"
+  expectEq stats.rejected 1 "failed-worker rejection count"
+  expectEq (← closeCalls.get) 1 "failed-worker exact child retirement"
+  match ← diagnostics.get with
+  | [diagnostic] =>
+      expectEq diagnostic.operation .append "failed-worker diagnostic operation"
+      expect (diagnostic.message.contains "worker fault") "failed-worker diagnostic message"
+  | values => fail s!"failed-worker diagnostics: expected one, got {values.length}"
+
 private def testFailedCloseResult : IO Unit := do
   let closeCalls ← IO.mkRef 0
   let diagnosticCalls ← IO.mkRef 0
@@ -416,6 +459,7 @@ def runAll : IO Unit := do
   testChildFailureIsolation
   testConcurrentCloseAndExactJoin
   testNestedBlockingCloseProgress
+  testSupervisedWorkerFailure
   testFailedCloseResult
   testRuntimeReportsLifecycleFailuresOnce
   testAppenderDecoration

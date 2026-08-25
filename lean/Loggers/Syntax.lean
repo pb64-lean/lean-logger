@@ -9,6 +9,17 @@ private def ensureFieldsLabel (label : TSyntax `ident) : MacroM Unit :=
   unless label.getId == `fields do
     Macro.throwErrorAt label "expected 'fields'"
 
+private def validateFieldKeys (keys : Array (TSyntax `str)) : MacroM Unit := do
+  let mut seen : List String := []
+  for keySyntax in keys do
+    let key := keySyntax.getString
+    unless isValidStructuredKey key do
+      Macro.throwErrorAt keySyntax s!"invalid event field name '{key}'"
+    if seen.contains key then
+      Macro.throwErrorAt keySyntax <|
+        s!"duplicate event field '{key}'; each name may appear once in fields!"
+    seen := key :: seen
+
 syntax (name := provenanceStx) "provenance%" : term
 
 /-- Elaborate the lexical declaration, module, file, and source position. -/
@@ -31,6 +42,7 @@ syntax "fields!" "[" logField,* "]" : term
 /-- Build heterogeneous event fields while retaining their inferred row. -/
 macro_rules
   | `(fields! [$[$keys:str := $values:term],*]) => do
+      validateFieldKeys keys
       let mut result ← `(Loggers.EventFields.empty)
       for key in keys, value in values do
         result ← `(Loggers.EventFields.insert $result $key $value)

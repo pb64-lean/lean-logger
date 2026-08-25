@@ -107,6 +107,7 @@ private abbrev BarrierResult := Except IO.Error Unit
 private inductive WorkItem where
   | event (event : LogEvent)
   | flush (result : IO.Promise BarrierResult)
+  | failure (error : IO.Error)
 
 private structure AsyncState where
   phase : AsyncPhase := .open
@@ -166,7 +167,7 @@ private def dropOldestUnfencedEvent
     | item :: rest =>
         let (barrierAfter, removed?) := remove rest
         match item with
-        | .flush _ =>
+        | .flush _ | .failure _ =>
             (true, removed?.map (item :: ·))
         | .event _ =>
             if barrierAfter then
@@ -334,6 +335,7 @@ private def processWork (shared : AsyncShared) : WorkItem → IO Unit
       | some error =>
           recordFlushFailure shared
           result.resolve (.error error)
+  | .failure error => throw error
 
 private def finish
     (shared : AsyncShared)
@@ -373,6 +375,7 @@ private def queuedBarriers (queue : Std.Queue WorkItem) : List (IO.Promise Barri
   queue.toArray.toList.filterMap fun
     | .event _ => none
     | .flush result => some result
+    | .failure _ => none
 
 private def failWorker (shared : AsyncShared) (error : IO.Error) : IO Unit := do
   let (barriers, terminalEvents) ← shared.state.atomically do
@@ -406,7 +409,8 @@ private def supervisedWorker (shared : AsyncShared) : IO Unit := do
   catch error =>
     failWorker shared error
 
-/-- Start a bounded worker that takes exclusive lifecycle ownership of `child`. -/
+/-- Start a bounded worker that takes exclusive lifecycle ownership of `child`
+after options validate. Acquisition failure retires the child before returning. -/
 def AsyncAppender.start
     (child : StartedAppender)
     (services : RuntimeServices := {})
@@ -415,22 +419,32 @@ def AsyncAppender.start
   | .error error => throw <| IO.userError (toString error)
   | .ok () => pure ()
   let services ← services.activate
-  let shared : AsyncShared := {
-    options
-    child
-    services
-    state := ← Std.Mutex.new ({} : AsyncState)
-    workAvailable := ← Std.Condvar.new
-    spaceAvailable := ← Std.Condvar.new
-    closeResult := ← IO.Promise.new
-  }
-  let worker ← IO.asTask (supervisedWorker shared) .dedicated
-  pure {
-    name := child.name
-    shared
-    worker
-    flushLock := ← Std.Mutex.new ()
-  }
+  try
+    let shared : AsyncShared := {
+      options
+      child
+      services
+      state := ← Std.Mutex.new ({} : AsyncState)
+      workAvailable := ← Std.Condvar.new
+      spaceAvailable := ← Std.Condvar.new
+      closeResult := ← IO.Promise.new
+    }
+    let flushLock ← Std.Mutex.new ()
+    let worker ← IO.asTask (supervisedWorker shared) .dedicated
+    pure {
+      name := child.name
+      shared
+      worker
+      flushLock
+    }
+  catch error =>
+    if let some closeError ← attemptIO child.close then
+      services.report {
+        component := child.name
+        operation := .close
+        message := toString closeError
+      }
+    throw error
 
 private def enqueueFlushBarrier (appender : AsyncAppender) : IO (IO.Promise BarrierResult) :=
   appender.shared.state.atomically do
@@ -477,6 +491,22 @@ private def requestClose
     else
       pure false
 
+private def beginFailure (appender : AsyncAppender) (error : IO.Error) : IO Bool :=
+  appender.shared.state.atomically do
+    let state ← get
+    if state.phase == .open then
+      set {
+        state with
+        phase := .closing
+        quiescing := true
+        queue := queueFromList (.failure error :: state.queue.toArray.toList)
+      }
+      liftM appender.shared.spaceAvailable.notifyAll
+      liftM appender.shared.workAvailable.notifyAll
+      pure true
+    else
+      pure false
+
 /-- Make blocking admission prompt without releasing the owned child.
 
 Events with capacity available may still enter: an owning runtime uses this
@@ -489,6 +519,21 @@ def AsyncAppender.quiesce (appender : AsyncAppender) : IO Unit := do
       set { state with quiescing := true }
     liftM appender.shared.spaceAvailable.notifyAll
   appender.shared.child.quiesce
+
+/-- Request a supervised terminal worker failure.
+
+When this call wins the lifecycle transition, ordinary admission is fenced,
+blocked admission is quiesced, pending queue work is discarded by the exact
+worker, pending flushes receive `error`, and the child is retired once. The
+resulting failure is replayed by `flush` and `close`. This explicit seam is also
+useful for deterministic supervisor tests. -/
+def AsyncAppender.requestFailure
+    (appender : AsyncAppender)
+    (error : IO.Error) : IO Bool := do
+  let ownsFailure ← beginFailure appender error
+  if ownsFailure then
+    appender.shared.child.quiesce
+  pure ownsFailure
 
 /-- Atomically fence ordinary admission, retain an owner-only terminal batch,
 drain normal work, retire the child with that batch, and join the exact worker.

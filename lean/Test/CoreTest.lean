@@ -29,7 +29,7 @@ error:
 #check ({ findImpl := fun env => env.1 } : HasKey [("identity", Nat)] "identity" Nat)
 
 /--
-error:
+error: duplicate event field 'duplicate'
 -/
 #guard_msgs (error, substring := true) in
 def duplicateFields := fields! ["duplicate" := (1 : Nat), "duplicate" := (2 : Nat)]
@@ -42,7 +42,7 @@ def invalidStaticContext : Logger [] Unit :=
   pushNew "bad key" "value" do pure ()
 
 /--
-error: Tactic `decide` proved
+error: invalid event field name 'bad=key'
 -/
 #guard_msgs (error, substring := true) in
 def invalidStaticFields := fields! ["bad=key" := (1 : Nat)]
@@ -138,6 +138,24 @@ private def testCarrierParametricity : IO Unit := do
   let event ← onlyEvent events
   expectEq event.context [("requestId", .str "state-r-1")] "StateM context"
   expectEq event.fields [("count", .nat 2)] "StateM fields"
+
+private def exceptProgram : LoggerT [] (ExceptT String IO) Unit :=
+  pushNew "requestId" "except-r-1" do
+    log! .info "except carrier"
+
+private def testExceptTCarrier : IO Unit := do
+  let events ← IO.mkRef ([] : List LogEvent)
+  let core : CoreCtx (ExceptT String IO) := {
+    enabled := fun _ _ => pure true
+    now := pure 0
+    sink := fun event => ExceptT.lift (events.modify (· ++ [event]))
+    close := pure ()
+  }
+  match ← ExceptT.run (runWith core exceptProgram) with
+  | .error error => fail s!"ExceptT carrier failed: {error}"
+  | .ok () => pure ()
+  let event ← onlyEvent (← events.get)
+  expectEq event.context [("requestId", .str "except-r-1")] "ExceptT context"
 
 private def secretProgram : Logger [] String := do
   let secret := Secret.protect "application-secret"
@@ -308,6 +326,53 @@ private def testEventFieldPolicies : IO Unit := do
       expectEq typedAfter.fields [("identity", .str "typed")] "typed event-field precedence"
   | other => fail s!"expected three event-field policy events, got {other.length}"
 
+private def contextUtilityProgram : Logger [] (Except DynamicError Unit) :=
+  withDynMDC "dynamic" (.str "runtime") do
+    pushNew "typed" (7 : Nat) do
+      expectEq (← mdc? "typed") (some (.nat 7)) "typed mdc?"
+      expectEq (← mdc? "dynamic") (some (.str "runtime")) "dynamic mdc?"
+      expectEq (← mdc? "missing") none "missing mdc?"
+      clearMDC do
+        expectEq (← mdc? "typed") none "cleared typed mdc"
+        expectEq (← mdc? "dynamic") none "cleared dynamic mdc"
+        log! .info "cleared"
+      log! .info "restored"
+
+private def concurrentContextProgram : Logger [] (Task (Except IO.Error Unit)) :=
+  pushNew "requestId" "task-r-1" do
+    Logger.concurrently do
+      log! .info "concurrent"
+
+private def testContextUtilities : IO Unit := do
+  let events ← IO.mkRef ([] : List LogEvent)
+  let core := capturingCore events
+  match ← runWith core contextUtilityProgram with
+  | .error error => fail s!"context utility boundary failed: {error}"
+  | .ok () => pure ()
+  match ← events.get with
+  | [cleared, restored] =>
+      expectEq cleared.context [] "clearMDC context"
+      expectEq restored.context
+        [("typed", .nat 7), ("dynamic", .str "runtime")]
+        "clearMDC restoration"
+  | other => fail s!"expected two context-utility events, got {other.length}"
+
+  match ← runWith core <| withDynMDC "bad key" (.str "invalid") (pure ()) with
+  | .error (.invalidName "bad key") => pure ()
+  | result => fail s!"invalid dynamic context key: got {repr result}"
+  match EventFields.empty.mergeDynamic .reject [("bad=key", .str "invalid")] with
+  | .error (.invalidName "bad=key") => pure ()
+  | _ => fail "invalid dynamic event-field key produced the wrong result"
+
+  events.set []
+  let task ← runWith core concurrentContextProgram
+  match ← IO.wait task with
+  | .error error => fail s!"Logger.concurrently failed: {error}"
+  | .ok () => pure ()
+  let concurrent ← onlyEvent (← events.get)
+  expectEq concurrent.context [("requestId", .str "task-r-1")]
+    "Logger.concurrently context"
+
 private unsafe def observe (calls : IO.Ref Nat) (value : α) : α :=
   unsafeBaseIO do
     calls.modify (· + 1)
@@ -463,6 +528,7 @@ unsafe def runAll : IO Unit := do
   testLevels
   testTypedContextAndFields
   testCarrierParametricity
+  testExceptTCarrier
   testRedactionAndFieldLookup
   testRebindingAndRestoration
   testExceptionRestoration
@@ -471,6 +537,7 @@ unsafe def runAll : IO Unit := do
   testDuplicatePrecedesTypedCollision
   testDynamicPolicies
   testEventFieldPolicies
+  testContextUtilities
   testDisabledLaziness
   testFailureHelpers
   testFailureLoggingIsObservational

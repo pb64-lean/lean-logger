@@ -10,3 +10,15 @@ lean_test(
     srcs = ["PublicApiTest.lean"],
     deps = ["@lean-logger//:lean_logger"],
 )
+
+lean_test(
+    name = "layer_api_test",
+    size = "small",
+    srcs = ["LayerApiTest.lean"],
+    deps = [
+        "@lean-logger//lean/Loggers:core",
+        "@lean-logger//lean/Loggers:format",
+        "@lean-logger//lean/Loggers:runtime",
+        "@lean-logger//lean/Loggers:testkit",
+    ],
+)
