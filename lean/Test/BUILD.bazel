@@ -11,3 +11,11 @@ lean_test(
     strip_module_prefix = "lean",
     deps = ["//lean/Loggers:core"],
 )
+
+lean_test(
+    name = "testkit_test",
+    size = "small",
+    srcs = ["TestkitTest.lean"],
+    strip_module_prefix = "lean",
+    deps = ["//lean/Loggers:testkit"],
+)

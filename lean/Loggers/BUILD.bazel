@@ -57,8 +57,5 @@ lean_library(
         "Testkit/Gate.lean",
     ],
     strip_module_prefix = "lean",
-    deps = [
-        ":core",
-        ":runtime",
-    ],
+    deps = [":core"],
 )
