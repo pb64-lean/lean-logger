@@ -17,10 +17,53 @@ error: Unknown constant `Loggers.HasKey.mk`
 #check Loggers.HasKey.mk
 
 /--
+error: Unknown constant `Loggers.HasKey.findImpl`
+-/
+#guard_msgs (error, substring := true) in
+#check Loggers.HasKey.findImpl
+
+/--
+error:
+-/
+#guard_msgs (error, substring := true) in
+#check ({ findImpl := fun env => env.1 } : HasKey [("identity", Nat)] "identity" Nat)
+
+/--
 error:
 -/
 #guard_msgs (error, substring := true) in
 def duplicateFields := fields! ["duplicate" := (1 : Nat), "duplicate" := (2 : Nat)]
+
+/--
+error: Tactic `decide` proved
+-/
+#guard_msgs (error, substring := true) in
+def invalidStaticContext : Logger [] Unit :=
+  pushNew "bad key" "value" do pure ()
+
+/--
+error: Tactic `decide` proved
+-/
+#guard_msgs (error, substring := true) in
+def invalidStaticFields := fields! ["bad=key" := (1 : Nat)]
+
+/--
+error: expected 'fields'
+-/
+#guard_msgs (error, substring := true) in
+def invalidFieldArgumentLabel : Logger [] Unit :=
+  log! .info "invalid label" (fieldValues := fields! [])
+
+private def fields : Nat :=
+  7
+
+private def downstreamEventLiteral : LogEvent :=
+  { timestamp := 0
+    level := .info
+    logger := "Downstream"
+    provenance := { declaration := `Test.Core.downstreamEventLiteral, module := `Test.Core }
+    message := "constructed"
+    fields := [] }
 
 private def fail (message : String) : IO α :=
   throw (IO.userError message)
@@ -77,6 +120,39 @@ private def testTypedContextAndFields : IO Unit := do
     "typed fields"
   expect (event.provenance.declaration.toString.endsWith "structuredProgram")
     "provenance must name the lexical declaration"
+
+private def stateCore : CoreCtx (StateM (List LogEvent)) :=
+  { enabled := fun _ _ => pure true
+    now := pure 0
+    sink := fun event => modify (· ++ [event])
+    close := pure () }
+
+private def stateProgram : LoggerT [] (StateM (List LogEvent)) Unit :=
+  pushNew "requestId" "state-r-1" do
+    log! .info "pure carrier" (fields := fields! ["count" := (2 : Nat)])
+
+private def testCarrierParametricity : IO Unit := do
+  let (_, events) := runWith stateCore stateProgram []
+  let event ← onlyEvent events
+  expectEq event.context [("requestId", .str "state-r-1")] "StateM context"
+  expectEq event.fields [("count", .nat 2)] "StateM fields"
+
+private def secretProgram : Logger [] String := do
+  let secret := Secret.protect "application-secret"
+  pushNew "credential" secret do
+    log! .info "redacted"
+      (fields := fields! ["secretField" := secret])
+  pure secret.reveal
+
+private def testRedactionAndFieldLookup : IO Unit := do
+  let typedFields := EventFields.empty.insert "count" (7 : Nat)
+  expectEq (typedFields.get "count") 7 "typed event-field lookup"
+  let events ← IO.mkRef ([] : List LogEvent)
+  let revealed ← runWith (capturingCore events) secretProgram
+  expectEq revealed "application-secret" "secret reveal"
+  let event ← onlyEvent (← events.get)
+  expectEq event.context [("credential", .str "***")] "context redaction"
+  expectEq event.fields [("secretField", .str "***")] "event-field redaction"
 
 private def rebindingProgram : Logger [] Unit :=
   pushNew "identity" "outer" do
@@ -143,6 +219,20 @@ private def testTypedCollision : IO Unit := do
   | _ => fail s!"typed collision: got {repr result}"
   expectEq (← events.get) [] "colliding action suppression"
 
+private def duplicateTypedCollisionProgram : Logger [] (Except DynamicError Unit) :=
+  pushNew "identity" "typed" do
+    mergeDynMDC .overwrite
+      [("identity", .str "first"), ("identity", .str "second")] do
+      log! .info "must not run"
+
+private def testDuplicatePrecedesTypedCollision : IO Unit := do
+  let events ← IO.mkRef ([] : List LogEvent)
+  let result ← runWith (capturingCore events) duplicateTypedCollisionProgram
+  match result with
+  | .error (.duplicateInput "identity") => pure ()
+  | _ => fail s!"duplicate/typed precedence: got {repr result}"
+  expectEq (← events.get) [] "duplicate input action suppression"
+
 private def policyProgram : Logger [] (Except DynamicError Unit) :=
   withDynMDC "color" (.str "red") do
     let preserved ← mergeDynMDC .preserve [("color", .str "blue")] do
@@ -173,25 +263,126 @@ private def testDynamicPolicies : IO Unit := do
       expectEq overwritten.context [("color", .str "blue")] "overwrite policy"
   | other => fail s!"expected two policy events, got {other.length}"
 
-private structure Explosive where
+private def eventFieldPolicyProgram : Logger [] Unit := do
+  let base ←
+    match EventFields.empty.mergeDynamic .reject [("color", .str "red")] with
+    | .ok value => pure value
+    | .error error => fail s!"base event fields failed: {error}"
+  let preserved ←
+    match base.mergeDynamic .preserve [("color", .str "blue")] with
+    | .ok value => pure value
+    | .error error => fail s!"preserved event fields failed: {error}"
+  log! .info "preserved event fields" (fields := preserved)
+  let overwritten ←
+    match base.mergeDynamic .overwrite [("color", .str "blue")] with
+    | .ok value => pure value
+    | .error error => fail s!"overwritten event fields failed: {error}"
+  log! .info "overwritten event fields" (fields := overwritten)
+  match base.mergeDynamic .reject [("color", .str "blue")] with
+  | .error (.dynamicCollision "color") => pure ()
+  | _ => fail "rejected event fields produced the wrong result"
+  let dynamicFirst ←
+    match EventFields.empty.mergeDynamic .reject [("identity", .str "dynamic")] with
+    | .ok value => pure value
+    | .error error => fail s!"dynamic-first event fields failed: {error}"
+  let typedAfter := dynamicFirst.insert "identity" "typed"
+  log! .info "typed event-field precedence" (fields := typedAfter)
+  let typedFirst := EventFields.empty.insert "identity" "typed"
+  match typedFirst.mergeDynamic .overwrite [("identity", .str "dynamic")] with
+  | .error (.typedCollision "identity") => pure ()
+  | _ => fail "typed-first event-field collision produced the wrong result"
+  match typedFirst.mergeDynamic .overwrite
+      [("identity", .str "first"), ("identity", .str "second")] with
+  | .error (.duplicateInput "identity") => pure ()
+  | _ => fail "event-field duplicate/typed precedence produced the wrong result"
 
-private instance : ToLogValue Explosive where
-  toLogValue _ := panic! "disabled context conversion was forced"
+private def testEventFieldPolicies : IO Unit := do
+  let events ← IO.mkRef ([] : List LogEvent)
+  runWith (capturingCore events) eventFieldPolicyProgram
+  match ← events.get with
+  | [preserved, overwritten, typedAfter] =>
+      expectEq preserved.fields [("color", .str "red")] "preserved event fields"
+      expectEq overwritten.fields [("color", .str "blue")] "overwritten event fields"
+      expectEq typedAfter.fields [("identity", .str "typed")] "typed event-field precedence"
+  | other => fail s!"expected three event-field policy events, got {other.length}"
 
-private def disabledProgram : Logger [] Unit :=
-  pushNew "explosive" ({} : Explosive) do
-    log! .debug "disabled {(panic! "message forced" : String)}"
-      (fields := fields! ["field" := (panic! "field forced" : String)])
-    logErr! .debug (panic! "cause forced" : IO.Error) "disabled error"
+private unsafe def observe (calls : IO.Ref Nat) (value : α) : α :=
+  unsafeBaseIO do
+    calls.modify (· + 1)
+    pure value
 
-private def testDisabledLaziness : IO Unit := do
+private structure CountedContext where
+  calls : IO.Ref Nat
+
+private unsafe instance : ToLogValue CountedContext where
+  toLogValue value := observe value.calls (.str "context")
+
+private unsafe def disabledProgram
+    (contextCalls messageCalls fieldCalls causeCalls : IO.Ref Nat) : Logger [] Unit :=
+  pushNew "explosive" ({ calls := contextCalls } : CountedContext) do
+    log! .debug "disabled {observe messageCalls "message"}"
+      (fields := fields! ["field" := observe fieldCalls "value"])
+    logErr! .debug (observe causeCalls (IO.userError "cause")) "disabled error"
+
+private unsafe def acceptedForcingProgram
+    (contextCalls messageCalls fieldCalls causeCalls : IO.Ref Nat) : Logger [] Unit :=
+  pushNew "counted" ({ calls := contextCalls } : CountedContext) do
+    logErr! .info (observe causeCalls (IO.userError "cause"))
+      "accepted {observe messageCalls "message"}"
+      (fields := fields! ["field" := observe fieldCalls "value"])
+
+private unsafe def successfulFailureProgram
+    (messageCalls fieldCalls : IO.Ref Nat) : Logger [] (Except String Nat) :=
+  logFailure! .warn (.ok 7 : Except String Nat)
+    "unused {observe messageCalls "message"}"
+    (fields := fields! ["field" := observe fieldCalls "value"])
+
+private unsafe def rebindForcingProgram
+    (outerCalls innerCalls : IO.Ref Nat) : Logger [] Unit :=
+  pushNew "identity" ({ calls := outerCalls } : CountedContext) do
+    rebindMDC "identity" ({ calls := innerCalls } : CountedContext) do
+      log! .info "visible binding only"
+
+private unsafe def testDisabledLaziness : IO Unit := do
   let events ← IO.mkRef ([] : List LogEvent)
   let nowCalls ← IO.mkRef 0
   let sinkCalls ← IO.mkRef 0
-  runWith (capturingCore events false (some nowCalls) (some sinkCalls)) disabledProgram
+  let contextCalls ← IO.mkRef 0
+  let messageCalls ← IO.mkRef 0
+  let fieldCalls ← IO.mkRef 0
+  let causeCalls ← IO.mkRef 0
+  runWith (capturingCore events false (some nowCalls) (some sinkCalls)) <|
+    disabledProgram contextCalls messageCalls fieldCalls causeCalls
   expectEq (← events.get) [] "disabled events"
   expectEq (← nowCalls.get) 0 "disabled clock"
   expectEq (← sinkCalls.get) 0 "disabled sink"
+  expectEq (← contextCalls.get) 0 "disabled context conversion"
+  expectEq (← messageCalls.get) 0 "disabled message construction"
+  expectEq (← fieldCalls.get) 0 "disabled field construction"
+  expectEq (← causeCalls.get) 0 "disabled cause construction"
+
+  runWith (capturingCore events) <|
+    acceptedForcingProgram contextCalls messageCalls fieldCalls causeCalls
+  expectEq (← contextCalls.get) 1 "accepted context conversion"
+  expectEq (← messageCalls.get) 1 "accepted message construction"
+  expectEq (← fieldCalls.get) 1 "accepted field construction"
+  expectEq (← causeCalls.get) 1 "accepted cause construction"
+
+  let successMessageCalls ← IO.mkRef 0
+  let successFieldCalls ← IO.mkRef 0
+  let result ← runWith (capturingCore events) <|
+    successfulFailureProgram successMessageCalls successFieldCalls
+  match result with
+  | .ok 7 => pure ()
+  | _ => fail "successful failure helper changed its result"
+  expectEq (← successMessageCalls.get) 0 "successful failure helper message"
+  expectEq (← successFieldCalls.get) 0 "successful failure helper fields"
+
+  let outerCalls ← IO.mkRef 0
+  let innerCalls ← IO.mkRef 0
+  runWith (capturingCore events) <| rebindForcingProgram outerCalls innerCalls
+  expectEq (← outerCalls.get) 0 "shadowed context conversion"
+  expectEq (← innerCalls.get) 1 "visible context conversion"
 
 private def failureProgram : Logger [] (Except String Nat × Except String Nat) := do
   let failed ← logFailure! .warn (.error "bad" : Except String Nat) "operation failed"
@@ -210,6 +401,18 @@ private def testFailureHelpers : IO Unit := do
   expectEq (event.cause.map fun cause => cause.summary) (some "bad") "failure cause"
   expectEq event.fields [("attempt", .nat 3)] "failure fields"
 
+private def testFailureLoggingIsObservational : IO Unit := do
+  let core : CoreCtx IO :=
+    { enabled := fun _ _ => pure true
+      now := pure 0
+      sink := fun _ => throw (IO.userError "observational sink failure")
+      close := pure () }
+  let result ← runWith core <|
+    logFailure! .error (.error "original" : Except String Nat) "failed"
+  match result with
+  | .error "original" => pure ()
+  | _ => fail "failure helper did not preserve the original result"
+
 private def testTapErrorPreservesPrimary : IO Unit := do
   let core : CoreCtx IO :=
     { enabled := fun _ _ => pure true
@@ -223,6 +426,12 @@ private def testTapErrorPreservesPrimary : IO Unit := do
     expect ((toString error).contains "primary failure")
       "tapError! must preserve the primary application error"
 
+private def richSnapshotProgram :
+    Logger [] (Except DynamicError (Snapshot IO [("requestId", String)])) :=
+  withDynMDC "traceId" (.str "dynamic-trace") do
+    pushNew "requestId" "captured-request" do
+      withLogger "Captured.Logger" capture
+
 private def testSnapshots : IO Unit := do
   let events ← IO.mkRef ([] : List LogEvent)
   let core := capturingCore events
@@ -234,21 +443,39 @@ private def testSnapshots : IO Unit := do
   match ← IO.wait task with
   | .ok taskValue => expectEq taskValue "captured" "snapshot task"
   | .error error => fail s!"snapshot task failed: {error}"
+  let richResult ← runWith core richSnapshotProgram
+  let rich ←
+    match richResult with
+    | .ok snapshot => pure snapshot
+    | .error error => fail s!"rich snapshot failed: {error}"
+  rich.run (log! .info "after parent scope")
+  let event ← onlyEvent (← events.get)
+  expectEq event.logger "Captured.Logger" "snapshot logger override"
+  expectEq event.context
+    [("requestId", .str "captured-request"), ("traceId", .str "dynamic-trace")]
+    "snapshot canonical context"
 
-def runAll : IO Unit := do
+unsafe def runAll : IO Unit := do
+  expectEq fields 7 "ordinary fields identifier"
+  expectEq downstreamEventLiteral.fields [] "downstream record field syntax"
   testLevels
   testTypedContextAndFields
+  testCarrierParametricity
+  testRedactionAndFieldLookup
   testRebindingAndRestoration
   testExceptionRestoration
   testDynamicPrecedenceAndHiding
   testTypedCollision
+  testDuplicatePrecedesTypedCollision
   testDynamicPolicies
+  testEventFieldPolicies
   testDisabledLaziness
   testFailureHelpers
+  testFailureLoggingIsObservational
   testTapErrorPreservesPrimary
   testSnapshots
 
 end Test.Core
 
-def main : IO Unit :=
+unsafe def main : IO Unit :=
   Test.Core.runAll

@@ -26,6 +26,17 @@ structure PatternWidth where
   maximum? : Option Nat := none
 deriving Repr, BEq, Inhabited, Lean.ToExpr
 
+/-- Apply truncation first, then the requested minimum-width padding. -/
+def PatternWidth.apply (width : PatternWidth) (value : String) : String :=
+  let value :=
+    match width.maximum? with
+    | some maximum => if value.length > maximum then (value.takeEnd maximum).toString else value
+    | none => value
+  match width.minimum? with
+  | none => value
+  | some minimum =>
+      if width.leftAlign then padRight value minimum else padLeft value minimum
+
 /-- A validated date-time format retained in its parsed representation. -/
 structure DatePattern where
   source : String
@@ -61,35 +72,10 @@ private def quotePatternWidth (width : PatternWidth) : Lean.Term :=
   Lean.Syntax.mkCApp ``PatternWidth.mk
     #[Lean.quote width.leftAlign, Lean.quote width.minimum?, Lean.quote width.maximum?]
 
-private meta def quotePatternConversion : PatternConversion → Lean.Elab.Term.TermElabM Lean.Term
-  | .date pattern => do
-      let source : Lean.TSyntax `str := ⟨Lean.Syntax.mkStrLit pattern.source⟩
-      `(Loggers.Format.PatternConversion.date
-          { source := $(Lean.quote pattern.source), format := datespec($source) })
-  | .level => pure <| Lean.Syntax.mkCApp ``PatternConversion.level #[]
-  | .logger => pure <| Lean.Syntax.mkCApp ``PatternConversion.logger #[]
-  | .message => pure <| Lean.Syntax.mkCApp ``PatternConversion.message #[]
-  | .cause => pure <| Lean.Syntax.mkCApp ``PatternConversion.cause #[]
-  | .contextValue key =>
-      pure <| Lean.Syntax.mkCApp ``PatternConversion.contextValue #[Lean.quote key]
-  | .context => pure <| Lean.Syntax.mkCApp ``PatternConversion.context #[]
-  | .fieldValue key =>
-      pure <| Lean.Syntax.mkCApp ``PatternConversion.fieldValue #[Lean.quote key]
-  | .fieldSet => pure <| Lean.Syntax.mkCApp ``PatternConversion.fieldSet #[]
-
-private meta def quotePatternPart : PatternPart → Lean.Elab.Term.TermElabM Lean.Term
-  | .literal value => pure <| Lean.Syntax.mkCApp ``PatternPart.literal #[Lean.quote value]
-  | .newline => pure <| Lean.Syntax.mkCApp ``PatternPart.newline #[]
-  | .conversion width conversion => do
-      let quoted ← quotePatternConversion conversion
-      pure <| Lean.Syntax.mkCApp ``PatternPart.conversion #[quotePatternWidth width, quoted]
-
-private meta def quoteCompiledPattern
-    (pattern : CompiledPattern) : Lean.Elab.Term.TermElabM Lean.Term := do
-  let parts ← pattern.parts.mapM quotePatternPart
-  pure <| Lean.Syntax.mkCApp ``CompiledPattern.mk #[Lean.quote parts]
-
 namespace Pattern
+
+private def maximumWidth : Nat :=
+  4096
 
 private def error (offset : Nat) (message : String) : Except PatternError α :=
   .error { offset, message }
@@ -119,6 +105,10 @@ private def parseWidth
     | _ => pure (none, remaining, offset)
   if leftAlign && minimum?.isNone then
     error conversionOffset "left alignment requires a minimum width"
+  else if minimum?.getD 0 > maximumWidth then
+    error conversionOffset s!"minimum width exceeds the limit of {maximumWidth}"
+  else if maximum?.getD 0 > maximumWidth then
+    error conversionOffset s!"maximum width exceeds the limit of {maximumWidth}"
   else
     pure ({ leftAlign, minimum?, maximum? }, remaining, offset)
 
@@ -140,6 +130,49 @@ where
         else
           pure (String.ofList reversed.reverse, rest, offset + 1)
     | char :: rest => collect rest (char :: reversed) (offset + 1)
+
+private def parseDateBraced
+    (remaining : List Char)
+    (offset conversionOffset : Nat) :
+    Except PatternError (String × List Char × Nat) :=
+  match remaining with
+  | '{' :: rest => collect rest [] (offset + 1) none false
+  | _ => error conversionOffset "%d requires a braced argument"
+where
+  collect
+      (remaining : List Char)
+      (reversed : List Char)
+      (offset : Nat)
+      (quote? : Option Char)
+      (escaped : Bool) :=
+    match remaining with
+    | [] => error conversionOffset "unterminated argument to %d"
+    | char :: rest =>
+        if escaped then
+          collect rest (char :: reversed) (offset + 1) quote? false
+        else
+          match quote? with
+          | some quote =>
+              let nextQuote? := if char == quote then none else quote?
+              collect rest (char :: reversed) (offset + 1) nextQuote? false
+          | none =>
+              if char == '\\' then
+                collect rest (char :: reversed) (offset + 1) none true
+              else if char == '\'' || char == '"' then
+                collect rest (char :: reversed) (offset + 1) (some char) false
+              else if char == '}' then
+                if reversed.isEmpty then
+                  error conversionOffset "%d requires a nonempty argument"
+                else
+                  pure (String.ofList reversed.reverse, rest, offset + 1)
+              else
+                collect rest (char :: reversed) (offset + 1) none false
+
+private def validateNamedKey
+    (label key : String)
+    (offset : Nat) : Except PatternError Unit :=
+  unless isValidStructuredKey key do
+    error offset s!"%{label} contains an invalid structured key '{key}'"
 
 private def checkContextSchema
     (schemas : PatternSchemas)
@@ -189,7 +222,7 @@ private def parseConversion
           match remaining with
           | '{' :: _ =>
               let (format, rest, nextOffset) ←
-                parseBraced "d" remaining offset conversionOffset
+                parseDateBraced remaining offset conversionOffset
               let parsed : Except String (Std.Time.GenericFormat .any) :=
                 Std.Time.GenericFormat.spec format
               match parsed with
@@ -205,11 +238,13 @@ private def parseConversion
       | "X" =>
           let (key, rest, nextOffset) ←
             parseBraced "X" remaining offset conversionOffset
+          validateNamedKey "X" key conversionOffset
           checkContextSchema schemas key conversionOffset
           pure (.conversion width (.contextValue key), rest, nextOffset)
       | "field" =>
           let (key, rest, nextOffset) ←
             parseBraced "field" remaining offset conversionOffset
+          validateNamedKey "field" key conversionOffset
           checkFieldSchema schemas key conversionOffset
           pure (.conversion width (.fieldValue key), rest, nextOffset)
       | _ => error conversionOffset s!"unknown conversion '%{word}'"
@@ -246,10 +281,17 @@ def compile
 
 end Pattern
 
-private def findBinding?
+/-- Render the first binding with `key`, or `-` when it is absent. -/
+def renderNamedBinding
     (key : String)
-    (bindings : List (String × LogValue)) : Option LogValue :=
-  (bindings.find? fun binding => binding.1 == key).map (·.2)
+    (bindings : List (String × LogValue)) : String :=
+  (bindings.find? fun binding => binding.1 == key)
+    |>.map (renderLogValueText ·.2)
+    |>.getD "-"
+
+/-- Render an optional cause, using the pattern-language missing marker. -/
+def renderOptionalCause (cause : Option Cause) : String :=
+  cause.map renderCauseText |>.getD "-"
 
 private def renderConversion (conversion : PatternConversion) (event : LogEvent) : String :=
   match conversion with
@@ -257,21 +299,11 @@ private def renderConversion (conversion : PatternConversion) (event : LogEvent)
   | .level => event.level.toUpperString
   | .logger => event.logger
   | .message => event.message
-  | .cause => event.cause.map renderCauseText |>.getD "-"
-  | .contextValue key => findBinding? key event.context |>.map renderLogValueText |>.getD "-"
+  | .cause => renderOptionalCause event.cause
+  | .contextValue key => renderNamedBinding key event.context
   | .context => renderBindings event.context
-  | .fieldValue key => findBinding? key event.fields |>.map renderLogValueText |>.getD "-"
+  | .fieldValue key => renderNamedBinding key event.fields
   | .fieldSet => renderBindings event.fields
-
-private def applyWidth (width : PatternWidth) (value : String) : String :=
-  let value :=
-    match width.maximum? with
-    | some maximum => if value.length > maximum then (value.takeEnd maximum).toString else value
-    | none => value
-  match width.minimum? with
-  | none => value
-  | some minimum =>
-      if width.leftAlign then padRight value minimum else padLeft value minimum
 
 /-- Render an event from an already compiled pattern. -/
 def CompiledPattern.render (pattern : CompiledPattern) : Layout := fun event =>
@@ -279,7 +311,7 @@ def CompiledPattern.render (pattern : CompiledPattern) : Layout := fun event =>
     match part with
     | .literal value => output ++ value
     | .newline => output ++ "\n"
-    | .conversion width conversion => output ++ applyWidth width (renderConversion conversion event)
+    | .conversion width conversion => output ++ width.apply (renderConversion conversion event)
 
 /-- Context keys named by a compiled pattern, in source order. -/
 def CompiledPattern.contextKeys (pattern : CompiledPattern) : List String :=
@@ -293,6 +325,58 @@ def CompiledPattern.fieldKeys (pattern : CompiledPattern) : List String :=
     | .conversion _ (.fieldValue key) => some key
     | _ => none
 
+private meta def quoteDateFormat (pattern : DatePattern) : Lean.Elab.Term.TermElabM Lean.Term := do
+  let source : Lean.TSyntax `str := ⟨Lean.Syntax.mkStrLit pattern.source⟩
+  `(datespec($source))
+
+private meta def quoteSpecializedConversion
+    (conversion : PatternConversion)
+    (event : Lean.Term) : Lean.Elab.Term.TermElabM Lean.Term := do
+  let timestamp := Lean.Syntax.mkCApp ``LogEvent.timestamp #[event]
+  let level := Lean.Syntax.mkCApp ``LogEvent.level #[event]
+  let logger := Lean.Syntax.mkCApp ``LogEvent.logger #[event]
+  let message := Lean.Syntax.mkCApp ``LogEvent.message #[event]
+  let cause := Lean.Syntax.mkCApp ``LogEvent.cause #[event]
+  let context := Lean.Syntax.mkCApp ``LogEvent.context #[event]
+  let fields := Lean.Syntax.mkCApp ``LogEvent.fields #[event]
+  match conversion with
+  | .date pattern =>
+      pure <| Lean.Syntax.mkCApp ``timestampWithFormat #[timestamp, ← quoteDateFormat pattern]
+  | .level => pure <| Lean.Syntax.mkCApp ``Level.toUpperString #[level]
+  | .logger => pure logger
+  | .message => pure message
+  | .cause => pure <| Lean.Syntax.mkCApp ``renderOptionalCause #[cause]
+  | .contextValue key =>
+      pure <| Lean.Syntax.mkCApp ``renderNamedBinding #[Lean.quote key, context]
+  | .context => pure <| Lean.Syntax.mkCApp ``renderBindings #[context]
+  | .fieldValue key =>
+      pure <| Lean.Syntax.mkCApp ``renderNamedBinding #[Lean.quote key, fields]
+  | .fieldSet => pure <| Lean.Syntax.mkCApp ``renderBindings #[fields]
+
+private meta def quoteSpecializedPart
+    (part : PatternPart)
+    (event : Lean.Term) : Lean.Elab.Term.TermElabM Lean.Term := do
+  match part with
+  | .literal value => pure (Lean.quote value)
+  | .newline => pure (Lean.quote "\n")
+  | .conversion width conversion =>
+      let value ← quoteSpecializedConversion conversion event
+      if width == {} then
+        pure value
+      else
+        pure <| Lean.Syntax.mkCApp ``PatternWidth.apply #[quotePatternWidth width, value]
+
+private meta def quoteSpecializedLayout
+    (pattern : CompiledPattern) : Lean.Elab.Term.TermElabM Lean.Term := do
+  let eventName ← Lean.mkFreshUserName `event
+  let event := Lean.mkIdent eventName
+  let pieces ← pattern.parts.mapM (quoteSpecializedPart · event)
+  let body := pieces.toList.foldr
+    (fun piece output => Lean.Syntax.mkCApp ``String.append #[piece, output])
+    (Lean.quote "")
+  let eventIdentifier : Lean.TSyntax `ident := ⟨event⟩
+  `(fun ($eventIdentifier : Loggers.LogEvent) => $body)
+
 end Format
 end Loggers
 
@@ -301,13 +385,28 @@ open Lean Elab Term
 namespace Loggers.Format
 
 syntax (name := patternBareStx) "pattern%" str : term
-syntax (name := patternContextStx) "pattern%"
-  "(" "contextSchema" ":=" term ")" str : term
-syntax (name := patternFieldStx) "pattern%"
-  "(" "fieldSchema" ":=" term ")" str : term
+syntax (name := patternOneSchemaStx) "pattern%"
+  "(" ident ":=" term ")" str : term
 syntax (name := patternSchemasStx) "pattern%"
-  "(" "contextSchema" ":=" term ")"
-  "(" "fieldSchema" ":=" term ")" str : term
+  "(" ident ":=" term ")"
+  "(" ident ":=" term ")" str : term
+
+private def schemaLabel (label : TSyntax `ident) : TermElabM Bool :=
+  match label.getId.toString with
+  | "contextSchema" => pure true
+  | "fieldSchema" => pure false
+  | _ => throwErrorAt label "expected 'contextSchema' or 'fieldSchema'"
+
+private def addSchemaChecks
+    (schema : TSyntax `term)
+    (keys : List String)
+    (body : Lean.Term) : TermElabM Lean.Term := do
+  if keys.isEmpty then
+    return ← `(let _ : Nonempty (List String) := ⟨$schema⟩; $body)
+  let mut checked := body
+  for key in keys.reverse do
+    checked ← `(let _ : ($(quote key) ∈ ($schema : List String)) := (by decide); $checked)
+  pure checked
 
 private def expandPattern
     (stx : Syntax)
@@ -321,14 +420,11 @@ private def expandPattern
     match Pattern.compile source with
     | .ok compiled => pure compiled
     | .error error => throwErrorAt patternSyntax s!"invalid logging pattern: {error}"
-  let quotedCompiled ← quoteCompiledPattern compiled
-  let mut expanded ← `(Loggers.Format.CompiledPattern.render $quotedCompiled)
+  let mut expanded ← quoteSpecializedLayout compiled
   if let some schema := contextSchema? then
-    for key in compiled.contextKeys.reverse do
-      expanded ← `(let _ : ($(quote key) ∈ $schema) := (by decide); $expanded)
+    expanded ← addSchemaChecks schema compiled.contextKeys expanded
   if let some schema := fieldSchema? then
-    for key in compiled.fieldKeys.reverse do
-      expanded ← `(let _ : ($(quote key) ∈ $schema) := (by decide); $expanded)
+    expanded ← addSchemaChecks schema compiled.fieldKeys expanded
   withMacroExpansion stx expanded <| elabTerm expanded expectedType?
 
 @[term_elab patternBareStx] def elabBarePattern : TermElab := fun stx expectedType? =>
@@ -336,21 +432,22 @@ private def expandPattern
   | `(pattern% $pattern:str) => expandPattern stx pattern.raw none none expectedType?
   | _ => throwUnsupportedSyntax
 
-@[term_elab patternContextStx] def elabContextPattern : TermElab := fun stx expectedType? =>
+@[term_elab patternOneSchemaStx] def elabOneSchemaPattern : TermElab := fun stx expectedType? => do
   match stx with
-  | `(pattern% (contextSchema := $schema:term) $pattern:str) =>
-      expandPattern stx pattern.raw (some schema) none expectedType?
+  | `(pattern% ($label:ident := $schema:term) $pattern:str) =>
+      if ← schemaLabel label then
+        expandPattern stx pattern.raw (some schema) none expectedType?
+      else
+        expandPattern stx pattern.raw none (some schema) expectedType?
   | _ => throwUnsupportedSyntax
 
-@[term_elab patternFieldStx] def elabFieldPattern : TermElab := fun stx expectedType? =>
+@[term_elab patternSchemasStx] def elabSchemasPattern : TermElab := fun stx expectedType? => do
   match stx with
-  | `(pattern% (fieldSchema := $schema:term) $pattern:str) =>
-      expandPattern stx pattern.raw none (some schema) expectedType?
-  | _ => throwUnsupportedSyntax
-
-@[term_elab patternSchemasStx] def elabSchemasPattern : TermElab := fun stx expectedType? =>
-  match stx with
-  | `(pattern% (contextSchema := $ctx:term) (fieldSchema := $fld:term) $pattern:str) =>
+  | `(pattern% ($first:ident := $ctx:term) ($second:ident := $fld:term) $pattern:str) =>
+      unless ← schemaLabel first do
+        throwErrorAt first "the first schema must be 'contextSchema'"
+      if ← schemaLabel second then
+        throwErrorAt second "the second schema must be 'fieldSchema'"
       expandPattern stx pattern.raw (some ctx) (some fld) expectedType?
   | _ => throwUnsupportedSyntax
 

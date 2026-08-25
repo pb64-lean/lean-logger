@@ -5,6 +5,10 @@ open Lean Elab Term
 
 namespace Loggers
 
+private def ensureFieldsLabel (label : TSyntax `ident) : MacroM Unit :=
+  unless label.getId == `fields do
+    Macro.throwErrorAt label "expected 'fields'"
+
 syntax (name := provenanceStx) "provenance%" : term
 
 /-- Elaborate the lexical declaration, module, file, and source position. -/
@@ -41,11 +45,12 @@ macro "log!" level:term:max message:interpolatedStr(term) : term =>
 
 /-- Emit a lazily constructed event with typed event-local fields. -/
 macro "log!" level:term:max message:interpolatedStr(term)
-    "(" "fields" ":=" fieldValues:term ")" : term =>
+    "(" label:ident ":=" fieldValues:term ")" : term => do
+  ensureFieldsLabel label
   `(Loggers.logEventNamed provenance% $level
-      (Thunk.mk fun _ => none)
-      (Thunk.mk fun _ => $fieldValues)
-      (Thunk.mk fun _ => s! $message))
+    (Thunk.mk fun _ => none)
+    (Thunk.mk fun _ => $fieldValues)
+    (Thunk.mk fun _ => s! $message))
 
 /-- Emit a lazily converted cause with no event-local fields. -/
 macro "logErr!" level:term:max error:term:max message:interpolatedStr(term) : term =>
@@ -56,11 +61,12 @@ macro "logErr!" level:term:max error:term:max message:interpolatedStr(term) : te
 
 /-- Emit a lazily converted cause with typed event-local fields. -/
 macro "logErr!" level:term:max error:term:max message:interpolatedStr(term)
-    "(" "fields" ":=" fieldValues:term ")" : term =>
+    "(" label:ident ":=" fieldValues:term ")" : term => do
+  ensureFieldsLabel label
   `(Loggers.logEventNamed provenance% $level
-      (Thunk.mk fun _ => some (Loggers.toCause $error))
-      (Thunk.mk fun _ => $fieldValues)
-      (Thunk.mk fun _ => s! $message))
+    (Thunk.mk fun _ => some (Loggers.toCause $error))
+    (Thunk.mk fun _ => $fieldValues)
+    (Thunk.mk fun _ => s! $message))
 
 /-- Log only the error branch of an `Except` value and pass it through. -/
 macro "logFailure!" level:term:max result:term:max message:interpolatedStr(term) : term =>
@@ -70,10 +76,11 @@ macro "logFailure!" level:term:max result:term:max message:interpolatedStr(term)
 
 /-- Log only the error branch of an `Except` value with typed fields. -/
 macro "logFailure!" level:term:max result:term:max message:interpolatedStr(term)
-    "(" "fields" ":=" fieldValues:term ")" : term =>
+    "(" label:ident ":=" fieldValues:term ")" : term => do
+  ensureFieldsLabel label
   `(Loggers.logFailureNamed provenance% $level $result
-      (Thunk.mk fun _ => $fieldValues)
-      (Thunk.mk fun _ => s! $message))
+    (Thunk.mk fun _ => $fieldValues)
+    (Thunk.mk fun _ => s! $message))
 
 /-- Log and rethrow an `IO.Error` from an action. -/
 macro "tapError!" level:term:max action:term:max message:interpolatedStr(term) : term =>
@@ -84,10 +91,11 @@ macro "tapError!" level:term:max action:term:max message:interpolatedStr(term) :
 
 /-- Log and rethrow an `IO.Error` from an action with typed fields. -/
 macro "tapError!" level:term:max action:term:max message:interpolatedStr(term)
-    "(" "fields" ":=" fieldValues:term ")" : term =>
+    "(" label:ident ":=" fieldValues:term ")" : term => do
+  ensureFieldsLabel label
   `(Loggers.Logger.tapError provenance% $level
-      (Thunk.mk fun _ => $fieldValues)
-      (Thunk.mk fun _ => s! $message)
-      $action)
+    (Thunk.mk fun _ => $fieldValues)
+    (Thunk.mk fun _ => s! $message)
+    $action)
 
 end Loggers

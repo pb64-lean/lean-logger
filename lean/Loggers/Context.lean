@@ -74,9 +74,13 @@ private abbrev PendingValue := String × Thunk LogValue
 private def isValidKeyChar (char : Char) : Bool :=
   char.isAlphanum || char == '_' || char == '-' || char == '.' || char == ':'
 
-/-- Runtime keys are deliberately conservative and bounded. -/
-def isValidDynamicKey (key : String) : Bool :=
+/-- Structured context and event-field keys are deliberately conservative and bounded. -/
+def isValidStructuredKey (key : String) : Bool :=
   !key.isEmpty && key.length ≤ 128 && key.toList.all isValidKeyChar
+
+/-- Compatibility name for validation at runtime-computed boundaries. -/
+def isValidDynamicKey (key : String) : Bool :=
+  isValidStructuredKey key
 
 private def keySetOfPending (pending : List PendingValue) : Std.HashSet String :=
   pending.foldl (fun keys item => keys.insert item.1) {}
@@ -106,20 +110,30 @@ private def replaceDynamic
 
 private def validateIncoming
     (typedKeys : Std.HashSet String)
-    (incoming : List (String × LogValue)) : Except DynamicError Unit :=
-  let rec visit (remaining : List (String × LogValue)) (seen : Std.HashSet String) :=
+    (incoming : List (String × LogValue)) : Except DynamicError Unit := do
+  let rec validateNames
+      (remaining : List (String × LogValue))
+      (seen : Std.HashSet String) : Except DynamicError Unit :=
     match remaining with
     | [] => .ok ()
     | (key, _) :: rest =>
-        if !isValidDynamicKey key then
+        if !isValidStructuredKey key then
           .error (.invalidName key)
         else if seen.contains key then
           .error (.duplicateInput key)
-        else if typedKeys.contains key then
+        else
+          validateNames rest (seen.insert key)
+  let rec validateTypedCollisions
+      (remaining : List (String × LogValue)) : Except DynamicError Unit :=
+    match remaining with
+    | [] => .ok ()
+    | (key, _) :: rest =>
+        if typedKeys.contains key then
           .error (.typedCollision key)
         else
-          visit rest (seen.insert key)
-  visit incoming {}
+          validateTypedCollisions rest
+  validateNames incoming {}
+  validateTypedCollisions incoming
 
 private def mergeDynamicValues
     (typedKeys : Std.HashSet String)
@@ -159,6 +173,7 @@ def EventFields.insert
     (key : String)
     (value : valueType)
     [ToLogValue valueType]
+    (_valid : isValidStructuredKey key := by decide)
     (_fresh : key ∉ Row.keys row := by decide) :
     EventFields ((key, valueType) :: row) :=
   { env := (value, fields.env)
@@ -229,6 +244,7 @@ def pushNew [Monad m]
     (value : valueType)
     [ToLogValue valueType]
     (action : LoggerT ((key, valueType) :: row) m α)
+    (_valid : isValidStructuredKey key := by decide)
     (_fresh : key ∉ Row.keys row := by decide) : LoggerT row m α :=
   ReaderT.adapt (extendCtx key value) action
 
@@ -365,7 +381,7 @@ def logEventNamed [Monad m]
       }
 
 /-- Log the error branch of a result and pass the result through unchanged. -/
-def logFailureNamed [Monad m] [ToCause errorType]
+def logFailureNamed [Monad m] [MonadExceptOf IO.Error m] [ToCause errorType]
     (site : Provenance)
     (level : Level)
     (result : Except errorType α)
@@ -374,10 +390,13 @@ def logFailureNamed [Monad m] [ToCause errorType]
   match result with
   | .ok _ => pure result
   | .error error =>
-      logEventNamed site level
-        (Thunk.mk fun _ => some (toCause error))
-        fields
-        message
+      try
+        logEventNamed site level
+          (Thunk.mk fun _ => some (toCause error))
+          fields
+          message
+      catch _ =>
+        pure ()
       pure result
 
 /-- Log an `IO.Error` from an action and rethrow the original error. Logging
