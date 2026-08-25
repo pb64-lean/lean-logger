@@ -13,6 +13,33 @@ lean_test(
 )
 
 lean_test(
+    name = "format_test",
+    size = "small",
+    srcs = ["FormatTest.lean"],
+    strip_module_prefix = "lean",
+    deps = ["//lean/Loggers:format"],
+)
+
+lean_test(
+    name = "runtime_test",
+    size = "small",
+    srcs = ["RuntimeTest.lean"],
+    strip_module_prefix = "lean",
+    deps = ["//lean/Loggers:runtime"],
+)
+
+lean_test(
+    name = "async_appender_test",
+    size = "small",
+    srcs = ["AsyncAppenderTest.lean"],
+    strip_module_prefix = "lean",
+    deps = [
+        "//lean/Loggers:runtime",
+        "//lean/Loggers:testkit",
+    ],
+)
+
+lean_test(
     name = "testkit_test",
     size = "small",
     srcs = ["TestkitTest.lean"],
