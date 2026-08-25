@@ -310,6 +310,10 @@ private def testConcurrentCloseAndFinalCounts : IO Unit := do
 
 private def testFailedCloseResult : IO Unit := do
   let closeCalls ← IO.mkRef 0
+  let diagnosticCalls ← IO.mkRef 0
+  let services : RuntimeServices := {
+    diagnostic := fun _ => diagnosticCalls.modify (· + 1)
+  }
   let child : StartedAppender := {
     name := "failed-close"
     append := fun _ => pure ()
@@ -317,13 +321,30 @@ private def testFailedCloseResult : IO Unit := do
       closeCalls.modify (· + 1)
       throw (IO.userError "close failed")
   }
-  let suppressor ← DuplicateSuppressor.start child
+  let suppressor ← DuplicateSuppressor.start child services
   expectError suppressor.close "close failed" "first failed close"
   expectError suppressor.close "close failed" "repeated failed close"
   let stats ← suppressor.stats
   expectEq stats.phase .failed "failed close phase"
   expectEq stats.closeFailures 1 "failed close counter"
   expectEq (← closeCalls.get) 1 "shared failed close result"
+  expectEq (← diagnosticCalls.get) 0 "explicit close failure diagnostics"
+
+private def testFailedFlushResult : IO Unit := do
+  let diagnosticCalls ← IO.mkRef 0
+  let services : RuntimeServices := {
+    diagnostic := fun _ => diagnosticCalls.modify (· + 1)
+  }
+  let child : StartedAppender := {
+    name := "failed-flush"
+    append := fun _ => pure ()
+    flush := throw (IO.userError "flush failed")
+  }
+  let suppressor ← DuplicateSuppressor.start child services
+  expectError suppressor.flush "flush failed" "explicit failed flush"
+  expectEq (← suppressor.stats).flushFailures 1 "failed flush counter"
+  expectEq (← diagnosticCalls.get) 0 "explicit flush failure diagnostics"
+  suppressor.close
 
 private def testNonrecursiveDiagnostics : IO Unit := do
   let diagnosticCalls ← IO.mkRef 0
@@ -385,6 +406,30 @@ private def testBlockingAsyncComposition : IO Unit := do
   expectEq (← suppressor.stats).childFailures 1 "rejected child delivery accounting"
   expectEq (← suppressor.stats).phase .closed "composed close phase"
 
+private def testCloseWaitsForInFlightDelivery : IO Unit := do
+  let appendGate ← Gate.new
+  let closeGate ← Gate.new
+  let child : StartedAppender := {
+    name := "in-flight"
+    append := fun _ => appendGate.enter
+    close := closeGate.enter
+  }
+  let suppressor ← DuplicateSuppressor.start child (options := {
+    allowedPerWindow := 2
+    window := Duration.ofNanoseconds 100
+    capacity := 1
+  })
+  let producer ← IO.asTask (suppressor.append <| event "in-flight") .dedicated
+  appendGate.waitEntered
+  let closer ← IO.asTask suppressor.close .dedicated
+  closeGate.waitEntered
+  closeGate.release
+  expect (!(← IO.hasFinished closer)) "close returned before an in-flight delivery finished"
+  appendGate.release
+  discard <| waitTask producer
+  discard <| waitTask closer
+  expectEq (← suppressor.stats).phase .closed "in-flight close phase"
+
 private def testAppenderDecoration : IO Unit := do
   let capture ← Capture.new
   let spec := (AppenderSpec.custom "decorated" fun _ => pure {
@@ -415,8 +460,10 @@ def runAll : IO Unit := do
   testDeterministicLruEviction
   testConcurrentCloseAndFinalCounts
   testFailedCloseResult
+  testFailedFlushResult
   testNonrecursiveDiagnostics
   testBlockingAsyncComposition
+  testCloseWaitsForInFlightDelivery
   testAppenderDecoration
 
 end Test.DuplicateSuppression

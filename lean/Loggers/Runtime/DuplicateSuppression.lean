@@ -112,6 +112,7 @@ private abbrev CloseResult := Except IO.Error Unit
 private structure SuppressionState where
   phase : DuplicateSuppressionPhase := .open
   entries : List Entry := []
+  inFlight : Nat := 0
   counters : SuppressionCounters := {}
   closeFailure? : Option IO.Error := none
 
@@ -120,6 +121,7 @@ private structure SuppressionShared where
   child : StartedAppender
   services : RuntimeServices
   state : Std.Mutex SuppressionState
+  deliveriesDrained : IO.Promise Unit
   closeResult : IO.Promise CloseResult
 
 /-- A bounded duplicate suppressor that owns one started child appender. -/
@@ -301,7 +303,7 @@ private def decideEvent (shared : SuppressionShared) (event : LogEvent) : IO Del
     let (next, plan) := match takeEntry key state.entries with
       | none => planNewKey shared state key event
       | some (entry, remaining) => planExistingKey shared state entry remaining event
-    set next
+    set { next with inFlight := state.inFlight + 1 }
     pure plan
 
 private def report
@@ -345,15 +347,30 @@ private def deliverPlan (shared : SuppressionShared) (plan : DeliveryPlan) : IO 
   if let some event := plan.original? then
     appendChild shared event
 
+private def releaseDelivery (shared : SuppressionShared) : IO Unit :=
+  shared.state.atomically do
+    let state ← get
+    let remaining := state.inFlight - 1
+    set { state with inFlight := remaining }
+    if state.phase != .open && remaining == 0 then
+      liftM (shared.deliveriesDrained.resolve ())
+
 /-- Apply one atomic suppression decision, then call the child without holding state locks.
 
 Synthetic records precede the original from the same call. Deliveries from
-concurrent calls may interleave according to the child's concurrency policy. -/
+concurrent calls may interleave according to the child's concurrency policy.
+The `admitted` counter records suppression decisions; an unsuccessful child
+delivery is recorded separately as a child failure. -/
 def DuplicateSuppressor.append
     (suppressor : DuplicateSuppressor)
     (event : LogEvent) : IO Unit := do
   let plan ← decideEvent suppressor.shared event
-  deliverPlan suppressor.shared plan
+  try
+    deliverPlan suppressor.shared plan
+  catch error =>
+    releaseDelivery suppressor.shared
+    throw error
+  releaseDelivery suppressor.shared
 
 private def awaitClose (shared : SuppressionShared) : IO CloseResult := do
   match ← IO.wait shared.closeResult.result? with
@@ -383,7 +400,6 @@ def DuplicateSuppressor.flush (suppressor : DuplicateSuppressor) : IO Unit := do
           pure none
         catch error =>
           recordChildFailure suppressor.shared .flush
-          report suppressor.shared .flush error
           pure (some error)
       pure (FlushDisposition.completed failure?)
   match disposition with
@@ -399,6 +415,8 @@ private def beginClose (shared : SuppressionShared) : IO Bool :=
     let state ← get
     if state.phase == .open then
       set { state with phase := .closing }
+      if state.inFlight == 0 then
+        liftM (shared.deliveriesDrained.resolve ())
       pure true
     else
       pure false
@@ -427,6 +445,11 @@ private def completeClose (shared : SuppressionShared) (result : CloseResult) : 
       | .error error => { state with phase := .failed, closeFailure? := some error }
   shared.closeResult.resolve result
 
+private def awaitDeliveries (shared : SuppressionShared) : IO Unit := do
+  match ← IO.wait shared.deliveriesDrained.result? with
+  | some () => pure ()
+  | none => throw <| IO.userError "duplicate suppressor delivery-drain promise was dropped"
+
 private def closeOwner (suppressor : DuplicateSuppressor) : IO Unit := do
   let summaries ← closeSummaries suppressor.shared
   for event in summaries do
@@ -437,19 +460,22 @@ private def closeOwner (suppressor : DuplicateSuppressor) : IO Unit := do
       pure none
     catch error =>
       recordChildFailure suppressor.shared .close
-      report suppressor.shared .close error
       pure (some error)
+  awaitDeliveries suppressor.shared
   completeClose suppressor.shared <| match failure? with
     | none => .ok ()
     | some error => .error error
 
-/-- Emit final summaries, close the child exactly once, and share the result. -/
+/-- Fence new decisions, emit final summaries, close the child once, and share the result.
+
+Close waits for every selected delivery attempt to finish. Closing the child
+may reject an append already blocked in that child's admission policy, so
+callers requiring successful acceptance must still quiesce producers first. -/
 def DuplicateSuppressor.close (suppressor : DuplicateSuppressor) : IO Unit := do
   if ← beginClose suppressor.shared then
     try
       closeOwner suppressor
     catch error =>
-      report suppressor.shared .close error
       completeClose suppressor.shared (.error error)
   match ← awaitClose suppressor.shared with
   | .ok () => pure ()
@@ -481,11 +507,13 @@ def DuplicateSuppressor.start
   match options.validate with
   | .error error => throw <| IO.userError (toString error)
   | .ok () => pure ()
+  let services ← services.activate
   let shared : SuppressionShared := {
     options
     child
     services
     state := ← Std.Mutex.new ({} : SuppressionState)
+    deliveriesDrained := ← IO.Promise.new
     closeResult := ← IO.Promise.new
   }
   pure {

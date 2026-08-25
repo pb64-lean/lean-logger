@@ -16,6 +16,14 @@ private def expectEq [BEq α] [Repr α] (actual expected : α) (label : String) 
   unless actual == expected do
     fail s!"{label}: expected {repr expected}, got {repr actual}"
 
+private def expectError (action : IO Unit) (fragment : String) (label : String) : IO Unit := do
+  try
+    action
+    fail s!"{label}: expected failure"
+  catch error =>
+    expect ((toString error).contains fragment)
+      s!"{label}: unexpected error: {error}"
+
 private def waitTask (task : Task (Except IO.Error α)) : IO α := do
   match ← IO.wait task with
   | .ok value => pure value
@@ -135,6 +143,56 @@ private def testAppenderFailureIsolation : IO Unit := do
       expectEq diagnostic.component "failing" "diagnostic component"
       expectEq diagnostic.operation .append "diagnostic operation"
   | other => fail s!"expected one diagnostic, got {other.length}"
+
+private def testRecursiveDiagnosticGuard : IO Unit := do
+  let diagnosticCalls ← IO.mkRef 0
+  let runtimeRef ← IO.mkRef (none : Option StartedRuntime)
+  let failing := AppenderSpec.custom "recursive-diagnostic" fun _ => pure {
+    append := fun _ => throw (IO.userError "sink failed")
+  }
+  let config : Loggers.LogConfig := {
+    appenders := #[failing]
+    services := {
+      diagnostic := fun _ => do
+        diagnosticCalls.modify (· + 1)
+        if let some runtime := ← runtimeRef.get then
+          runtime.core.sink (event "nested diagnostic")
+    }
+  }
+  let runtime ← config.start
+  runtimeRef.set (some runtime)
+  runtime.core.sink (event "first failure")
+  runtime.core.sink (event "second failure")
+  expectEq (← diagnosticCalls.get) 2
+    "recursive diagnostics are dropped and the guard is released"
+  runtime.close
+
+private def testOverlappingDiagnosticGuard : IO Unit := do
+  let diagnosticCalls ← IO.mkRef 0
+  let firstHook ← IO.mkRef true
+  let hookEntered ← IO.Promise.new
+  let hookRelease ← IO.Promise.new
+  let services ← ({
+    diagnostic := fun _ => do
+      diagnosticCalls.modify (· + 1)
+      if ← firstHook.get then
+        firstHook.set false
+        hookEntered.resolve ()
+        awaitUnit "diagnostic hook release" hookRelease
+  } : RuntimeServices).activate
+  let diagnostic : Diagnostic := {
+    component := "overlap"
+    operation := .append
+    message := "failure"
+  }
+  let firstReport ← IO.asTask <| services.report diagnostic
+  awaitUnit "diagnostic hook entry" hookEntered
+  services.report diagnostic
+  expectEq (← diagnosticCalls.get) 1 "overlapping diagnostic drop"
+  hookRelease.resolve ()
+  discard <| waitTask firstReport
+  services.report diagnostic
+  expectEq (← diagnosticCalls.get) 2 "diagnostic guard release after overlap"
 
 private def testSerializedAppender : IO Unit := do
   let firstEntered ← IO.Promise.new
@@ -270,6 +328,10 @@ private def testFileAppenderModes : IO Unit :=
     second.close
     expectEq (← IO.FS.readFile path) "one\ntwo\nthree\n" "appended file output"
 
+    let closed ← AppenderSpec.file "closed-file" path encoder .append |>.start {}
+    closed.close
+    expectError (closed.append (event "late")) "closed" "closed file appender"
+
 private def testRuntimeAdmissionFence : IO Unit := do
   let appendEntered ← IO.Promise.new
   let appendRelease ← IO.Promise.new
@@ -351,6 +413,8 @@ def runAll : IO Unit := do
   testConfigurationValidation
   testFilterOrderingAndShortCircuit
   testAppenderFailureIsolation
+  testRecursiveDiagnosticGuard
+  testOverlappingDiagnosticGuard
   testSerializedAppender
   testStartupUnwind
   testIdempotentClose

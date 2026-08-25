@@ -20,16 +20,49 @@ structure Diagnostic where
   message : String
 deriving Repr, BEq, Inhabited
 
-/-- Services supplied while starting appenders. -/
+/-- Services supplied while starting appenders.
+
+Diagnostic hooks are best-effort, nonblocking health observations. They must
+not be relied on as a durable event channel. -/
 structure RuntimeServices where
   diagnostic : Diagnostic → IO Unit := fun _ => pure ()
+  private diagnosticGuard? : Option (Std.Mutex Bool) := none
 
-/-- Report an infrastructure failure without allowing the diagnostic hook to recurse. -/
+private initialize fallbackDiagnosticGuard : Std.Mutex Bool ←
+  Std.Mutex.new false
+
+/-- Install or reuse the single-active diagnostic guard for one runtime tree. -/
+def RuntimeServices.activate (services : RuntimeServices) : BaseIO RuntimeServices := do
+  if services.diagnosticGuard?.isSome then
+    pure services
+  else
+    pure { services with diagnosticGuard? := some (← Std.Mutex.new false) }
+
+private def claimDiagnostic (guard : Std.Mutex Bool) : IO Bool :=
+  guard.atomically do
+    if ← get then
+      pure false
+    else
+      set true
+      pure true
+
+private def releaseDiagnostic (guard : Std.Mutex Bool) : IO Unit :=
+  guard.atomically do set false
+
+/-- Report an infrastructure failure without propagating hook failures.
+
+While a hook is active, both recursive and concurrently overlapping reports
+from the same runtime tree are dropped. Started components activate a
+tree-local guard; callers using `report` directly should activate services as
+well, because otherwise unactivated values share a process fallback guard. -/
 def RuntimeServices.report (services : RuntimeServices) (diagnostic : Diagnostic) : IO Unit := do
-  try
-    services.diagnostic diagnostic
-  catch _ =>
-    pure ()
+  let guard := services.diagnosticGuard?.getD fallbackDiagnosticGuard
+  if ← claimDiagnostic guard then
+    try
+      services.diagnostic diagnostic
+    catch _ =>
+      pure ()
+    releaseDiagnostic guard
 
 /-- Unserialized operations owned by one appender. -/
 structure AppenderTarget where
@@ -115,7 +148,12 @@ def StartedAppender.serialized
 /-- Compatibility spelling for constructing a serialized synchronous appender. -/
 abbrev StartedAppender.ofTarget := StartedAppender.serialized
 
-/-- Guard a started appender without changing its lifecycle or serialization. -/
+/-- Guard a started appender without changing its lifecycle or serialization.
+
+Filters run before child admission and outside the child's lifecycle boundary.
+They should be pure, prompt, and concurrency-safe. A filter racing with close
+may finish evaluation after the child has fenced admission, in which case an
+accepted event is rejected by the child. -/
 def StartedAppender.withFilters
     (appender : StartedAppender)
     (filters : Array Filter) : StartedAppender := {
@@ -181,6 +219,7 @@ abbrev AppenderSpec.decorate := AppenderSpec.mapStarted
 def AppenderSpec.start
     (spec : AppenderSpec)
     (services : RuntimeServices) : IO StartedAppender := do
+  let services ← services.activate
   let appender ← spec.startImpl services
   pure (appender.withFilters spec.filters)
 
@@ -233,9 +272,15 @@ def AppenderSpec.file
     let handle ← IO.FS.Handle.mk path <| match mode with
       | .truncate => .write
       | .append => .append
+    let handleRef ← IO.mkRef (some handle)
+    let withHandle (action : IO.FS.Handle → IO Unit) : IO Unit := do
+      match ← handleRef.get with
+      | some current => action current
+      | none => throw <| IO.userError s!"file appender {name} is closed"
     pure {
-      write := handle.write
-      flush := handle.flush
+      write := fun bytes => withHandle fun current => current.write bytes
+      flush := withHandle fun current => current.flush
+      close := handleRef.set none
     }
 
 /-- Route an event to every appender, isolating one appender's failure from the rest. -/

@@ -3,7 +3,12 @@ import Loggers.Runtime.Appender
 namespace Loggers
 namespace Runtime
 
-/-- Behavior when an asynchronous appender's event capacity is exhausted. -/
+/-- Behavior when an asynchronous appender's event capacity is exhausted.
+
+`dropOldest` may evict an event whose earlier offer returned an admitted result
+if that event has not yet been removed from the bounded queue. Pending flush
+barriers fence eviction: only events after the latest barrier are candidates,
+and an incoming event is dropped as `droppedNewest` when none is available. -/
 inductive OverflowPolicy where
   | block
   | dropNewest
@@ -37,7 +42,10 @@ inductive AsyncPhase where
   | failed
 deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- The exact outcome of one event admission attempt. -/
+/-- The exact outcome of one event admission attempt.
+
+`droppedNewest` describes which event was lost, so it can also be returned by
+`dropOldest` when a pending flush barrier protects every queued event. -/
 inductive Admission where
   | admitted
   | droppedNewest
@@ -45,7 +53,9 @@ inductive Admission where
   | rejected (phase : AsyncPhase)
 deriving Repr, BEq, DecidableEq, Inhabited
 
-/-- Whether an admission outcome transferred ownership of the supplied event. -/
+/-- Whether the supplied event entered the queue at the end of its offer.
+
+With `dropOldest`, a later offer may still evict an admitted queued event. -/
 def Admission.isAdmitted : Admission → Bool
   | .admitted | .admittedAfterDropOldest => true
   | .droppedNewest | .rejected _ => false
@@ -54,6 +64,7 @@ def Admission.isAdmitted : Admission → Bool
 structure AsyncStats where
   phase : AsyncPhase
   queued : Nat
+  pendingFlushes : Nat
   offered : Nat
   admitted : Nat
   delivered : Nat
@@ -130,13 +141,22 @@ private def attemptIO (action : IO Unit) : IO (Option IO.Error) := do
 private def queueFromList (items : List WorkItem) : Std.Queue WorkItem :=
   items.foldl (fun queue item => queue.enqueue item) Std.Queue.empty
 
-private def dropOldestEvent (queue : Std.Queue WorkItem) : Option (Std.Queue WorkItem) :=
-  let rec remove (remaining prefixRev : List WorkItem) :=
+private def dropOldestUnfencedEvent
+    (queue : Std.Queue WorkItem) : Option (Std.Queue WorkItem) :=
+  let rec remove (remaining : List WorkItem) : Bool × Option (List WorkItem) :=
     match remaining with
-    | [] => none
-    | .event _ :: rest => some (queueFromList (prefixRev.reverse ++ rest))
-    | item :: rest => remove rest (item :: prefixRev)
-  remove queue.toArray.toList []
+    | [] => (false, none)
+    | item :: rest =>
+        let (barrierAfter, removed?) := remove rest
+        match item with
+        | .flush _ =>
+            (true, removed?.map (item :: ·))
+        | .event _ =>
+            if barrierAfter then
+              (true, removed?.map (item :: ·))
+            else
+              (false, some rest)
+  (remove queue.toArray.toList).2.map queueFromList
 
 private def rejectAdmission (phase : AsyncPhase) : Std.AtomicT AsyncState IO Admission := do
   modify fun state => {
@@ -191,8 +211,14 @@ def AsyncAppender.offer (appender : AsyncAppender) (event : LogEvent) : IO Admis
           if initial.queuedEvents < appender.shared.options.capacity then
             enqueueEvent appender.shared event
           else
-            match dropOldestEvent initial.queue with
-            | none => throw <| IO.userError "asynchronous event queue invariant failed"
+            match dropOldestUnfencedEvent initial.queue with
+            | none =>
+                modify fun state => {
+                  state with counters := {
+                    state.counters with droppedNewest := state.counters.droppedNewest + 1
+                  }
+                }
+                pure .droppedNewest
             | some remaining =>
                 set {
                   initial with
@@ -268,7 +294,6 @@ private def processWork (shared : AsyncShared) : WorkItem → IO Unit
       | none => result.resolve (.ok ())
       | some error =>
           recordFlushFailure shared
-          report shared .flush (toString error)
           result.resolve (.error error)
 
 private def finish
@@ -284,9 +309,8 @@ private def finish
 
 private def shutdownChild (shared : AsyncShared) : IO Unit := do
   let closeFailure? ← attemptIO shared.child.close
-  if let some error := closeFailure? then
+  if closeFailure?.isSome then
     recordCloseFailure shared
-    report shared .close (toString error)
   match closeFailure? with
   | none => finish shared (.ok ())
   | some error => finish shared (.error error)
@@ -342,6 +366,7 @@ def AsyncAppender.start
   match options.validate with
   | .error error => throw <| IO.userError (toString error)
   | .ok () => pure ()
+  let services ← services.activate
   let shared : AsyncShared := {
     options
     child
@@ -370,7 +395,11 @@ private def enqueueFlushBarrier (appender : AsyncAppender) : IO (IO.Promise Barr
     else
       pure appender.shared.closeResult
 
-/-- Flush after every event admitted before this call has reached the child. -/
+/-- Process retained queue entries ordered before this barrier, then flush the child.
+
+Under `dropOldest`, an event admitted earlier but evicted before processing is
+not covered by this guarantee. Concurrent producers require external
+synchronization when a global admission barrier is needed. -/
 def AsyncAppender.flush (appender : AsyncAppender) : IO Unit :=
   appender.flushLock.atomically do
     let result ← liftM (awaitBarrier (← enqueueFlushBarrier appender))
@@ -403,6 +432,7 @@ def AsyncAppender.stats (appender : AsyncAppender) : IO AsyncStats :=
     pure {
       phase := state.phase
       queued := state.queuedEvents
+      pendingFlushes := (queuedBarriers state.queue).length
       offered := state.counters.offered
       admitted := state.counters.admitted
       delivered := state.counters.delivered

@@ -206,16 +206,17 @@ private def closeRuntime
 
 /-- Start a validated configuration and acquire its appenders in declaration order. -/
 def CompiledConfig.start (config : CompiledConfig) : IO StartedRuntime := do
-  let appenders ← startAppenders config.services config.appenders.toList
+  let services ← config.services.activate
+  let appenders ← startAppenders services config.appenders.toList
   let state ← Std.Mutex.new ({} : RuntimeState)
-  let close := closeRuntime state config.services appenders
+  let close := closeRuntime state services appenders
   let core : CoreCtx IO := {
     enabled := fun logger level => pure (config.levels.enabled logger level)
     now := config.now
-    sink := emitRuntime state config.services appenders
+    sink := emitRuntime state services appenders
     close
   }
-  pure ⟨core, appenders, config.services, state⟩
+  pure ⟨core, appenders, services, state⟩
 
 /-- Validate and start a logging configuration. -/
 def LogConfig.start (config : LogConfig) : IO StartedRuntime :=
@@ -223,17 +224,26 @@ def LogConfig.start (config : LogConfig) : IO StartedRuntime :=
   | .error error => throw <| IO.userError (toString error)
   | .ok compiled => compiled.start
 
-/-- Flush every appender while keeping the runtime open. -/
+/-- Flush every appender while keeping the runtime open.
+
+This is not a global producer barrier. Callers that need every previously
+started emission included must synchronize those producers before flushing. -/
 def StartedRuntime.flush (runtime : StartedRuntime) : IO Unit :=
   flushRuntime runtime.state runtime.services runtime.appenders
 
-/-- Close every appender in reverse acquisition order exactly once. -/
+/-- Close every appender in reverse acquisition order exactly once.
+
+Producers should be quiesced before close begins. Already-admitted runtime sink
+calls are awaited, but a filter still evaluating when close fences its child
+may subsequently have its accepted event rejected. -/
 def StartedRuntime.close (runtime : StartedRuntime) : IO Unit :=
   closeRuntime runtime.state runtime.services runtime.appenders
 
 /-- Run one empty-row logging computation under a bracketed runtime.
 
-An application failure remains primary if shutdown also fails. -/
+An application failure remains primary if shutdown also fails. The bracket
+assumes the action has quiesced any logging producers it started before it
+returns. -/
 def run (config : LogConfig) (action : Logger [] α) : IO α := do
   let runtime ← config.start
   let applicationResult : Except IO.Error α ← try
