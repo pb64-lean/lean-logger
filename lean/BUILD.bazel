@@ -1,0 +1,16 @@
+"""Public Lean import facade."""
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "loggers",
+    srcs = ["Loggers.lean"],
+    strip_module_prefix = "lean",
+    deps = [
+        "//lean/Loggers:core",
+        "//lean/Loggers:format",
+        "//lean/Loggers:runtime",
+    ],
+)

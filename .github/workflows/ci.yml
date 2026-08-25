@@ -1,0 +1,21 @@
+name: ci
+
+# Hermetic builds and tests run only for trusted revisions on the self-hosted
+# runner. Pull requests use the hosted static-assurance workflow.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "11 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: pb64-lean/.github/.github/workflows/bazel-ci.yml@main

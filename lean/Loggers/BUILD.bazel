@@ -1,0 +1,64 @@
+"""Layered logging libraries."""
+
+load("@rules_lean//lean:defs.bzl", "lean_library")
+
+package(default_visibility = ["//visibility:public"])
+
+lean_library(
+    name = "core",
+    srcs = [
+        "Context.lean",
+        "Core.lean",
+        "Event.lean",
+        "Level.lean",
+        "Syntax.lean",
+        "Value.lean",
+    ],
+    strip_module_prefix = "lean",
+)
+
+lean_library(
+    name = "format",
+    srcs = [
+        "Format.lean",
+        "Format/Json.lean",
+        "Format/Pattern.lean",
+        "Format/Text.lean",
+    ],
+    strip_module_prefix = "lean",
+    deps = [":core"],
+)
+
+lean_library(
+    name = "runtime",
+    srcs = [
+        "Runtime.lean",
+        "Runtime/Appender.lean",
+        "Runtime/AsyncAppender.lean",
+        "Runtime/Config.lean",
+        "Runtime/DuplicateSuppression.lean",
+        "Runtime/Filter.lean",
+        "Runtime/Lifecycle.lean",
+    ],
+    strip_module_prefix = "lean",
+    deps = [
+        ":core",
+        ":format",
+    ],
+)
+
+lean_library(
+    name = "testkit",
+    testonly = True,
+    srcs = [
+        "Testkit.lean",
+        "Testkit/Capture.lean",
+        "Testkit/Clock.lean",
+        "Testkit/Gate.lean",
+    ],
+    strip_module_prefix = "lean",
+    deps = [
+        ":core",
+        ":runtime",
+    ],
+)

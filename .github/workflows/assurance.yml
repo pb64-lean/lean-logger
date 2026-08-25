@@ -1,0 +1,19 @@
+name: assurance
+
+# Static source and proof-policy checks run on a hosted runner and are safe for
+# untrusted pull-request revisions.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assurance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    uses: pb64-lean/.github/.github/workflows/assurance.yml@main

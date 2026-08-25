@@ -1,0 +1,40 @@
+"""Bazel module definition for the Lean application logging library."""
+
+module(
+    name = "lean-logger",
+    version = "0.1.0",
+    compatibility_level = 1,
+    bazel_compatibility = [">=8.0.0"],
+)
+
+# Pin the build rules so a standalone checkout resolves reproducibly before a
+# registry release is available. Downstream roots retain control of overrides.
+bazel_dep(name = "rules_lean", version = "0.1.0")
+archive_override(
+    module_name = "rules_lean",
+    integrity = "sha256-R04+5hNuca2KRdLDQDnQ68hZYjpKcw6p6kz/aU/fmAc=",
+    strip_prefix = "rules_lean-fbc2dd0626da1dee86348ff4841798ea8c8cbb34",
+    urls = [
+        "https://github.com/pb64-lean/rules_lean/archive/fbc2dd0626da1dee86348ff4841798ea8c8cbb34.tar.gz",
+    ],
+)
+
+# This toolchain is used only for this module's own builds and tests. Consumers
+# select and register the Lean toolchain for their root module.
+lean = use_extension(
+    "@rules_lean//lean:extensions.bzl",
+    "lean",
+    dev_dependency = True,
+)
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@rules_lean//:nixpkgs.nix",
+    nix_file_deps = ["@rules_lean//:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+
+register_toolchains(
+    "@lean4_toolchain//:all",
+    dev_dependency = True,
+)
