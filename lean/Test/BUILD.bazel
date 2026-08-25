@@ -40,6 +40,17 @@ lean_test(
 )
 
 lean_test(
+    name = "duplicate_suppression_test",
+    size = "small",
+    srcs = ["DuplicateSuppressionTest.lean"],
+    strip_module_prefix = "lean",
+    deps = [
+        "//lean/Loggers:runtime",
+        "//lean/Loggers:testkit",
+    ],
+)
+
+lean_test(
     name = "testkit_test",
     size = "small",
     srcs = ["TestkitTest.lean"],
