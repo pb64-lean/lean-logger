@@ -41,7 +41,10 @@ def PatternWidth.apply (width : PatternWidth) (value : String) : String :=
 structure DatePattern where
   source : String
   format : Std.Time.GenericFormat .any
-deriving Repr, Inhabited
+deriving Inhabited
+
+instance : Repr DatePattern where
+  reprPrec pattern _ := repr pattern.source
 
 /-- Runtime-free conversion selected by a compiled pattern. -/
 inductive PatternConversion where

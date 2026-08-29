@@ -27,6 +27,7 @@ private def formatPlainDateTime
     | .G _ => some date.era
     | .y _ => some date.year
     | .u _ => some date.year
+    | .Y _ => some date.weekYear
     | .D _ => some (Sigma.mk date.year.isLeap date.dayOfYear)
     | .Qorq _ => some date.quarter
     | .w _ => some date.weekOfYear
@@ -59,7 +60,7 @@ private def formatPlainDateTime
 def timestampWithFormat
     (timestamp : Timestamp)
     (format : GenericFormat .any) : String :=
-  formatPlainDateTime timestamp.toPlainDateTimeAssumingUTC format
+  formatPlainDateTime (PlainDateTime.ofWallTime (timestamp.toWallTime TimeZone.Offset.zero)) format
 
 private def utcTimestampFormat : GenericFormat .any :=
   datespec("uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS")
