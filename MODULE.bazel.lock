@@ -320,7 +320,7 @@
     "@@rules_lean+//lean:extensions.bzl%lean": {
       "general": {
         "bzlTransitiveDigest": "sNAKOvirNsXUwCR12JmUfmNEK6pQLBjbMBBgEL4Kl+w=",
-        "usagesDigest": "Vs8Mz/moGliP5YvjEpbN8E4B43/8vU0ItvMswpsL6+g=",
+        "usagesDigest": "9L/Pl741Fyu1E5UB45lF5PSzAsjFUowpqCDfGGrKSXM=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -328,21 +328,15 @@
           "lean4_toolchain": {
             "repoRuleId": "@@rules_lean+//lean:repositories.bzl%lean_nix_toolchain_repository",
             "attributes": {
-              "nix_file": "@@rules_lean+//:nixpkgs.nix",
+              "nix_file": "@@//third_party/lean:nixpkgs.nix",
               "nix_file_deps": [
-                "@@rules_lean+//:nixpkgs.json"
+                "@@//third_party/lean:nixpkgs.json"
               ],
               "attr": "lean4_upstream_std"
             }
           }
         },
-        "recordedRepoMappingEntries": [
-          [
-            "",
-            "rules_lean",
-            "rules_lean+"
-          ]
-        ]
+        "recordedRepoMappingEntries": []
       }
     },
     "@@rules_python+//python/private/pypi:pip.bzl%pip_internal": {
