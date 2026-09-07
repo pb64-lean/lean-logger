@@ -320,7 +320,7 @@
     "@@rules_lean+//lean:extensions.bzl%lean": {
       "general": {
         "bzlTransitiveDigest": "sNAKOvirNsXUwCR12JmUfmNEK6pQLBjbMBBgEL4Kl+w=",
-        "usagesDigest": "0ttXaV4fmaNwGVelc54Y1Nnggj0PUf1CfNaPzh5ySdY=",
+        "usagesDigest": "2nA5DOv9IkfdVPiJNV+Vpr5mEgkbjr+3vk+ieWJwvTs=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -328,9 +328,9 @@
           "lean4_toolchain": {
             "repoRuleId": "@@rules_lean+//lean:repositories.bzl%lean_nix_toolchain_repository",
             "attributes": {
-              "nix_file": "@@rules_lean+//:nixpkgs.nix",
+              "nix_file": "@@lean-logger+//third_party/lean:nixpkgs.nix",
               "nix_file_deps": [
-                "@@rules_lean+//:nixpkgs.json"
+                "@@lean-logger+//third_party/lean:nixpkgs.json"
               ],
               "attr": "lean4_upstream_std"
             }
@@ -339,8 +339,8 @@
         "recordedRepoMappingEntries": [
           [
             "",
-            "rules_lean",
-            "rules_lean+"
+            "lean-logger",
+            "lean-logger+"
           ]
         ]
       }

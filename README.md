@@ -211,11 +211,12 @@ builds reproducible. Dependency metadata changes must refresh the lockfile
 explicitly with `bazel mod graph --lockfile_mode=update` before ordinary locked
 builds resume.
 
-The supported development matrix is Lean 4.27.0 from `lean-toolchain` and the
-Bazel-selected Lean 4.31.0-pre toolchain at commit
-`24bef91f9a20a45f074729e869461d374687de1c`. Other Lean versions are not part of
-the current compatibility claim. Lake supplies the editor project model and a
-compatibility build using the toolchain selected by `lean-toolchain`:
+Both `lean-toolchain` and Bazel select the released Lean 4.31.0 at commit
+`68218e876d2a38b1985b8590fff244a83c321783`. The downstream fixture registers
+that same compiler explicitly from the library's `third_party/lean` pin.
+Other Lean versions are not part of the current compatibility claim. Lake
+supplies the editor project model and a compatibility build using the toolchain
+selected by `lean-toolchain`:
 
 ```sh
 lake build
