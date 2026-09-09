@@ -1,0 +1,8 @@
+load("@rules_lean//lean:defs.bzl", "lean_library", "lean_test")
+package(default_visibility = ["//visibility:public"])
+lean_library(
+    name = "otel",
+    srcs = ["Loggers/OpenTelemetry.lean"],
+    deps = ["@lean-logger//lean:loggers", "@otel-lean//lean/OpenTelemetry:context"],
+)
+lean_test(name = "otel_test", srcs = ["Test.lean"], deps = [":otel"], size = "small")

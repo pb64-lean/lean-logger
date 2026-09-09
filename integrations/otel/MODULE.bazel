@@ -1,0 +1,27 @@
+"""Optional source-workspace integration; core lean-logger remains independent."""
+module(name = "lean_logger_otel_integration", version = "0.1.0")
+bazel_dep(name = "rules_lean", version = "0.1.0")
+local_path_override(module_name = "rules_lean", path = "../../../rules_lean")
+bazel_dep(name = "lean-logger", version = "0.1.0")
+local_path_override(module_name = "lean-logger", path = "../..")
+bazel_dep(name = "otel-lean", version = "0.1.0")
+local_path_override(module_name = "otel-lean", path = "../../../otel-lean")
+bazel_dep(name = "rules_lean_grpc", version = "0.1.0")
+local_path_override(module_name = "rules_lean_grpc", path = "../../../grpc-lean")
+bazel_dep(name = "http2-lean", version = "0.1.0", repo_name = "http2_lean")
+local_path_override(module_name = "http2-lean", path = "../../../http2-lean")
+bazel_dep(name = "tls13-lean", version = "0.1.0", repo_name = "tls13_lean")
+local_path_override(module_name = "tls13-lean", path = "../../../tls13-lean")
+bazel_dep(name = "grpc_lean_protobuf", version = "0.1.0")
+local_path_override(module_name = "grpc_lean_protobuf", path = "../../../grpc-lean/third_party/Lean-zh/protobuf")
+bazel_dep(name = "grpc_lean_protobuf_binary", version = "0.1.0")
+local_path_override(module_name = "grpc_lean_protobuf_binary", path = "../../../grpc-lean/third_party/Lean-zh/binary")
+lean = use_extension("@rules_lean//lean:extensions.bzl", "lean")
+lean.nix_toolchain(
+    name = "lean4",
+    attr = "lean4_upstream_std",
+    nix_file = "@lean-logger//third_party/lean:nixpkgs.nix",
+    nix_file_deps = ["@lean-logger//third_party/lean:nixpkgs.json"],
+)
+use_repo(lean, "lean4_toolchain")
+register_toolchains("@lean4_toolchain//:all")
