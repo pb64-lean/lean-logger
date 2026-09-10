@@ -259,7 +259,7 @@
     "@@googleapis+//:extensions.bzl%switched_rules": {
       "general": {
         "bzlTransitiveDigest": "vG6fuTzXD8MMvHWZEQud0MMH7eoC4GXY0va7VrFFh04=",
-        "usagesDigest": "1TJfFnr0Jwvm/4fUhGLKWntjAJm+DT5aHbyS7JWykYc=",
+        "usagesDigest": "jkslxl7ZnXMpz5SmwkqRHb+sKMbOujtrSmg7HiGxlYI=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
@@ -426,7 +426,7 @@
     "@@grpc+//bazel:grpc_deps.bzl%grpc_repo_deps_ext": {
       "general": {
         "bzlTransitiveDigest": "akGjSHwFQa378ZpbciduaJiLv9PTZjaJRkj6Cd7F/Bc=",
-        "usagesDigest": "Z26QZp+BO+JA3lXVmiYgAksjiJCi6os73HzdVzGRaw8=",
+        "usagesDigest": "QK8T0oO4C7lZnkWP1GHbAGMfiLuJLk/VBS82Z5NGXpU=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},
         "envVariables": {},
